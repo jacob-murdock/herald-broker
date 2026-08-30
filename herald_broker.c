@@ -3,7 +3,7 @@
  *
  * Out-of-tree room broker for the relay path. Data-blind: routes opaque
  * binary frames between clients in the same room; never parses egregore
- * payloads. POSIX sockets + libpthread.
+ * payloads. POSIX sockets or Winsock + libpthread.
  *
  * Wire (herald_room.h v1, with the N3 peer-id tail on JOIN):
  *   JOIN_ROOM  0x01  [u16 LE room_id_len, room_id, u16 LE name_len, name, u64 LE peer_id]
@@ -48,13 +48,9 @@
 /* Wire action codes only — no herald client / amphora dependency. */
 #include "wire.h"
 
-#include <arpa/inet.h>
 #include <ctype.h>
 #include <errno.h>
-#include <fcntl.h>
 #include <limits.h>
-#include <netinet/in.h>
-#include <netinet/tcp.h>
 #include <pthread.h>
 #include <signal.h>
 #include <stdarg.h>
@@ -63,10 +59,70 @@
 #include <stdlib.h>
 #include <string.h>
 #include <strings.h>
+#include <zlib.h>
+
+#if defined(_WIN32)
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef _WIN32_WINNT
+#define _WIN32_WINNT 0x0601
+#endif
+#include <winsock2.h>
+#include <ws2tcpip.h>
+#include <windows.h>
+typedef SOCKET BrokerSock;
+#define BROKER_INVALID_SOCK INVALID_SOCKET
+#define broker_close closesocket
+#define BROKER_SEND_FLAGS 0
+#define BROKER_EINTR WSAEINTR
+#define BROKER_EAGAIN WSAEWOULDBLOCK
+static int broker_sock_err(void) { return WSAGetLastError(); }
+static int broker_setsockopt_int(BrokerSock fd, int level, int opt, int value) {
+    return setsockopt(fd, level, opt, (const char *)&value, sizeof(value));
+}
+static int broker_send(BrokerSock fd, const void *data, size_t len, int flags) {
+    return send(fd, (const char *)data, (int)len, flags);
+}
+static int broker_recv(BrokerSock fd, void *buf, size_t len, int flags) {
+    return recv(fd, (char *)buf, (int)len, flags);
+}
+static int broker_net_init(void) {
+    static int once = 0;
+    static int ok = 0;
+    if (!once) {
+        WSADATA wsa;
+        ok = (WSAStartup(MAKEWORD(2, 2), &wsa) == 0);
+        once = 1;
+    }
+    return ok;
+}
+#else
+#include <arpa/inet.h>
+#include <fcntl.h>
+#include <netinet/in.h>
+#include <netinet/tcp.h>
 #include <sys/socket.h>
 #include <sys/time.h>
 #include <unistd.h>
-#include <zlib.h>
+typedef int BrokerSock;
+#define BROKER_INVALID_SOCK (-1)
+#define broker_close close
+#define BROKER_SEND_FLAGS MSG_NOSIGNAL
+#define BROKER_EINTR EINTR
+#define BROKER_EAGAIN EAGAIN
+static int broker_sock_err(void) { return errno; }
+static int broker_setsockopt_int(BrokerSock fd, int level, int opt, int value) {
+    return setsockopt(fd, level, opt, &value, sizeof(value));
+}
+static int broker_send(BrokerSock fd, const void *data, size_t len, int flags) {
+    return (int)send(fd, data, len, flags);
+}
+static int broker_recv(BrokerSock fd, void *buf, size_t len, int flags) {
+    return (int)recv(fd, buf, len, flags);
+}
+static int broker_net_init(void) { return 1; }
+#endif
 
 /* -- Config ------------------------------------------------------------ */
 
@@ -227,15 +283,16 @@ static void wr_u64_be(uint8_t *p, uint64_t v) {
 }
 
 /* Send all bytes; return 1 on success, 0 on error/disconnect. */
-static int send_all(int fd, const uint8_t *data, size_t len) {
+static int send_all(BrokerSock fd, const uint8_t *data, size_t len) {
     while (len > 0) {
-        ssize_t n = send(fd, data, len, MSG_NOSIGNAL);
+        int n = broker_send(fd, data, len, BROKER_SEND_FLAGS);
         if (n <= 0) {
-            if (n < 0 && (errno == EINTR || errno == EAGAIN))
+            int err = broker_sock_err();
+            if (n < 0 && (err == BROKER_EINTR || err == BROKER_EAGAIN))
                 continue;
             return 0;
         }
-        data += n;
+        data += (size_t)n;
         len -= (size_t)n;
     }
     return 1;
@@ -266,7 +323,7 @@ static size_t ws_encode_binary_header(uint8_t *hdr_out, size_t payload_len, int 
     return h;
 }
 
-static int ws_send_binary_raw(int fd, const uint8_t *payload, size_t len, int rsv1) {
+static int ws_send_binary_raw(BrokerSock fd, const uint8_t *payload, size_t len, int rsv1) {
     uint8_t hdr[14];
     size_t h = ws_encode_binary_header(hdr, len, rsv1);
     if (send_all(fd, hdr, h) != 1)
@@ -388,12 +445,12 @@ typedef struct {
     uint64_t len;
 } WsFrameHdr;
 
-static int ws_read_exact(int fd, uint8_t *buf, size_t len) {
+static int ws_read_exact(BrokerSock fd, uint8_t *buf, size_t len) {
     size_t got = 0;
     while (got < len) {
-        ssize_t n = recv(fd, buf + got, len - got, 0);
+        int n = broker_recv(fd, buf + got, len - got, 0);
         if (n <= 0) {
-            if (n < 0 && errno == EINTR)
+            if (n < 0 && broker_sock_err() == BROKER_EINTR)
                 continue;
             return 0;
         }
@@ -402,7 +459,7 @@ static int ws_read_exact(int fd, uint8_t *buf, size_t len) {
     return 1;
 }
 
-static int ws_read_frame_header(int fd, WsFrameHdr *out, size_t max_payload) {
+static int ws_read_frame_header(BrokerSock fd, WsFrameHdr *out, size_t max_payload) {
     uint8_t b[2];
     if (!ws_read_exact(fd, b, 2))
         return 0;
@@ -432,7 +489,7 @@ static int ws_read_frame_header(int fd, WsFrameHdr *out, size_t max_payload) {
     return 1;
 }
 
-static int ws_read_frame_payload(int fd, uint64_t len, int masked, uint8_t *out_buf) {
+static int ws_read_frame_payload(BrokerSock fd, uint64_t len, int masked, uint8_t *out_buf) {
     uint8_t mask[4] = {0};
     if (masked) {
         if (!ws_read_exact(fd, mask, 4))
@@ -630,12 +687,12 @@ static int ws_extensions_offers_pmd(const char *ext) {
 }
 
 /* Handshake result: 0 = fail, 1 = ok without PMD, 2 = ok with PMD. */
-static int ws_handshake_server(int fd) {
+static int ws_handshake_server(BrokerSock fd) {
     char buf[2048];
     size_t total = 0;
     /* Read until \r\n\r\n (header terminator). Cap at 2 KiB. */
     while (total < sizeof(buf) - 1) {
-        ssize_t n = recv(fd, buf + total, sizeof(buf) - 1 - total, 0);
+        int n = broker_recv(fd, buf + total, sizeof(buf) - 1 - total, 0);
         if (n <= 0)
             return 0;
         total += (size_t)n;
@@ -775,7 +832,7 @@ static void room_evict_if_empty_locked(Room *r) {
 /* -- Connection -------------------------------------------------------- */
 
 struct Conn {
-    int fd;
+    BrokerSock fd;
     pthread_t thread;
     pthread_mutex_t write_mu;
     char room_id[HERALD_BROKER_MAX_ROOM_ID];
@@ -789,7 +846,7 @@ struct Conn {
 /* Send an application payload; compress with RSV1 when PMD is on and
  * the deflate result is smaller. */
 static int ws_send_binary(Conn *c, const uint8_t *payload, size_t len) {
-    if (!c || c->closed || c->fd < 0)
+    if (!c || c->closed || c->fd == BROKER_INVALID_SOCK)
         return 0;
     if (!c->pmd || !payload)
         return ws_send_binary_raw(c->fd, payload, len, 0);
@@ -825,7 +882,7 @@ static void conn_remove_peer_locked(Room *r, Conn *c) {
 }
 
 static int conn_send_error(Conn *dst, uint8_t code, const char *msg) {
-    if (!dst || dst->closed || dst->fd < 0)
+    if (!dst || dst->closed || dst->fd == BROKER_INVALID_SOCK)
         return 0;
     size_t msg_len = msg ? strlen(msg) : 0;
     if (msg_len > 200)
@@ -1127,15 +1184,13 @@ static void *conn_thread_main(void *arg) {
     Conn *c = (Conn *)arg;
     int hs = ws_handshake_server(c->fd);
     if (!hs) {
-        broker_log("handshake failed; closing fd %d", c->fd);
+        broker_log("handshake failed; closing fd %d", (int)c->fd);
         goto done;
     }
     c->pmd = (hs == 2) ? 1 : 0;
     if (c->pmd)
-        broker_log("fd %d negotiated permessage-deflate", c->fd);
-    /* Set TCP_NODELAY so small frames don't sit in Nagle. */
-    int one = 1;
-    setsockopt(c->fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
+        broker_log("fd %d negotiated permessage-deflate", (int)c->fd);
+    broker_setsockopt_int(c->fd, IPPROTO_TCP, TCP_NODELAY, 1);
 
     size_t cap = HERALD_BROKER_RECV_INITIAL;
     if (cap > c->max_frame)
@@ -1281,7 +1336,7 @@ done:
     pthread_mutex_lock(&g_rooms_mu);
     conn_leave_room_locked(c);
     pthread_mutex_unlock(&g_rooms_mu);
-    close(c->fd);
+    broker_close(c->fd);
     pthread_mutex_destroy(&c->write_mu);
     free(c);
     conn_count_dec();
@@ -1291,7 +1346,13 @@ done:
 /* -- Main -------------------------------------------------------------- */
 
 int main(void) {
+#if !defined(_WIN32)
     signal(SIGPIPE, SIG_IGN);
+#endif
+    if (!broker_net_init()) {
+        fprintf(stderr, "winsock init failed\n");
+        return 1;
+    }
 
     const char *port_env = getenv("HERALD_BROKER_PORT");
     int port = port_env ? atoi(port_env) : HERALD_BROKER_DEFAULT_PORT;
@@ -1320,24 +1381,24 @@ int main(void) {
         stack_sz = (size_t)PTHREAD_STACK_MIN;
 #endif
 
-    int srv = socket(AF_INET, SOCK_STREAM, 0);
-    if (srv < 0) {
-        perror("socket");
+    BrokerSock srv = socket(AF_INET, SOCK_STREAM, 0);
+    if (srv == BROKER_INVALID_SOCK) {
+        fprintf(stderr, "socket: error %d\n", broker_sock_err());
         return 1;
     }
-    int one = 1;
-    setsockopt(srv, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
+    broker_setsockopt_int(srv, SOL_SOCKET, SO_REUSEADDR, 1);
 
-    struct sockaddr_in addr = {0};
+    struct sockaddr_in addr;
+    memset(&addr, 0, sizeof(addr));
     addr.sin_family = AF_INET;
     addr.sin_addr.s_addr = htonl(INADDR_ANY);
     addr.sin_port = htons((uint16_t)port);
     if (bind(srv, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
-        perror("bind");
+        fprintf(stderr, "bind: error %d\n", broker_sock_err());
         return 1;
     }
     if (listen(srv, 512) < 0) {
-        perror("listen");
+        fprintf(stderr, "listen: error %d\n", broker_sock_err());
         return 1;
     }
     fprintf(stderr, "[broker] listening on 0.0.0.0:%d (max_frame=%zu max_conns=%d stack=%zu)\n",
@@ -1346,21 +1407,21 @@ int main(void) {
     for (;;) {
         struct sockaddr_in caddr;
         socklen_t clen = sizeof(caddr);
-        int cfd = accept(srv, (struct sockaddr *)&caddr, &clen);
-        if (cfd < 0) {
-            if (errno == EINTR)
+        BrokerSock cfd = accept(srv, (struct sockaddr *)&caddr, &clen);
+        if (cfd == BROKER_INVALID_SOCK) {
+            if (broker_sock_err() == BROKER_EINTR)
                 continue;
-            perror("accept");
+            fprintf(stderr, "accept: error %d\n", broker_sock_err());
             continue;
         }
         if (!conn_try_admit()) {
-            broker_log("max connections (%d); rejecting fd %d", g_max_conns, cfd);
-            close(cfd);
+            broker_log("max connections (%d); rejecting", g_max_conns);
+            broker_close(cfd);
             continue;
         }
         Conn *c = (Conn *)calloc(1, sizeof(Conn));
         if (!c) {
-            close(cfd);
+            broker_close(cfd);
             conn_count_dec();
             continue;
         }
@@ -1376,7 +1437,7 @@ int main(void) {
         if (pthread_create(&c->thread, attr_ok ? &attr : NULL, conn_thread_main, c) != 0) {
             if (attr_ok)
                 pthread_attr_destroy(&attr);
-            close(cfd);
+            broker_close(cfd);
             pthread_mutex_destroy(&c->write_mu);
             free(c);
             conn_count_dec();
@@ -1388,3 +1449,4 @@ int main(void) {
     }
     return 0;
 }
+
