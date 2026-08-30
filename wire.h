@@ -5,13 +5,16 @@
  * tree can ship as a standalone FOSS repo without the rest of the
  * monorepo. Clients in-tree include it via herald_room.h.
  *
- * Wire (v1, JOIN carries peer_id tail):
+ * Wire (v1, JOIN carries a peer_id tail that the broker ignores):
  *   JOIN_ROOM  0x01  [u16 LE room_id_len, room_id, u16 LE name_len, name, u64 LE peer_id]
  *   LEAVE_ROOM 0x02
+ *   JOIN_ACK   0x03  [u64 LE assigned_peer_id]  (broker → joiner; authoritative id)
  *   BROADCAST  0x10  [opaque payload from client; broker fans out as
  *                     0x10 + u64 LE sender_peer_id + payload]
  *   DIRECT     0x11  [u64 LE dst_peer_id, opaque payload from client;
  *                     broker delivers 0x11 + u64 LE sender_peer_id + payload]
+ *   SIGNAL     0x12  [u64 LE dst_peer_id, opaque payload]; same rewrite as DIRECT;
+ *                     never stored as last_broadcast (P2P cand / HCAN)
  *   PRESENCE   0x20  [u8 kind (0=join, 1=leave), u64 LE peer_id, u16 LE name_len, name]
  *   ERROR      0x30  [u8 code, u16 LE msg_len, msg…]  (broker → client; reject JOIN)
  */
@@ -20,8 +23,10 @@
 
 #define HERALD_ROOM_ACTION_JOIN_ROOM 0x01u
 #define HERALD_ROOM_ACTION_LEAVE_ROOM 0x02u
+#define HERALD_ROOM_ACTION_JOIN_ACK 0x03u
 #define HERALD_ROOM_ACTION_BROADCAST 0x10u
 #define HERALD_ROOM_ACTION_DIRECT 0x11u
+#define HERALD_ROOM_ACTION_SIGNAL 0x12u
 #define HERALD_ROOM_ACTION_PRESENCE 0x20u
 /* Broker → client only. Sent before closing a rejected JOIN (room/peer caps). */
 #define HERALD_ROOM_ACTION_ERROR 0x30u

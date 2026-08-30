@@ -5,29 +5,39 @@
  * binary frames between clients in the same room; never parses egregore
  * payloads. POSIX sockets or Winsock + libpthread.
  *
- * Wire (herald_room.h v1, with the N3 peer-id tail on JOIN):
+ * Wire (herald_room.h v1; JOIN peer_id tail is ignored — broker assigns):
  *   JOIN_ROOM  0x01  [u16 LE room_id_len, room_id, u16 LE name_len, name, u64 LE peer_id]
  *   LEAVE_ROOM 0x02
+ *   JOIN_ACK   0x03  [u64 LE assigned_peer_id]  (broker → joiner)
  *   BROADCAST  0x10  [opaque payload from client; broker fans out as
  *                     0x10 + u64 LE sender_peer_id + payload]
  *   DIRECT     0x11  [u64 LE dst_peer_id, opaque payload from client;
  *                     broker delivers 0x11 + u64 LE sender_peer_id + payload]
+ *   SIGNAL     0x12  [u64 LE dst_peer_id, opaque]; same rewrite as DIRECT;
+ *                     excluded from last_broadcast
  *   PRESENCE   0x20  [u8 kind (0=join, 1=leave), u64 LE peer_id, u16 LE name_len, name]
  *   ERROR      0x30  [u8 code, u16 LE msg_len, msg…]  (broker → client; reject JOIN)
  *
  * Behavior:
- *   JOIN_ROOM   — add to room, broadcast PRESENCE_JOIN to others, send
- *                 cached last BROADCAST to the new joiner (late-join
- *                 catch-up). On peer/room-table cap: send ERROR then close.
+ *   JOIN_ROOM   — assign a unique peer id, JOIN_ACK the joiner, broadcast
+ *                 PRESENCE_JOIN to others, send cached last BROADCAST
+ *                 (late-join catch-up). On peer/room-table cap: ERROR then close.
  *   LEAVE_ROOM  — remove, broadcast PRESENCE_LEAVE to survivors.
- *   BROADCAST   — forward to all other peers, cache bytes for late joiners.
+ *   BROADCAST   — forward to all other peers, cache bytes for late joiners
+ *                 (not HCAN / SIGNAL).
  *   DIRECT      — route to dst peer_id (must be in the same room).
+ *   SIGNAL      — DIRECT-shaped; never cached.
  *   Disconnect  — same as LEAVE_ROOM.
  *
  * Env:
  *   HERALD_BROKER_PORT             (default 8787)
- *   HERALD_BROKER_MAX_FRAME        (default 1 MiB)
+ *   HERALD_BROKER_BIND             (default 127.0.0.1; 0.0.0.0 for all)
+ *   HERALD_BROKER_MAX_FRAME        (default 1 MiB; clamped to 4 MiB)
+ *   HERALD_BROKER_MAX_CATCHUP      (default 256 KiB; 0 = no last_broadcast)
  *   HERALD_BROKER_MAX_CONNECTIONS  (default 8192; 0 = unlimited)
+ *   HERALD_BROKER_ORIGIN           (optional comma-list; if set, a present
+ *                                   Origin header must match one entry)
+ *   HERALD_BROKER_HOST             (optional; if set, Host header must match)
  *   HERALD_BROKER_VERBOSE          (default 0; set 1 for log lines)
  *
  * WebSocket permessage-deflate (RFC 7692):
@@ -128,7 +138,15 @@ static int broker_net_init(void) { return 1; }
 
 #define HERALD_BROKER_DEFAULT_PORT 8787
 #define HERALD_BROKER_DEFAULT_MAX_FRAME (1u * 1024u * 1024u)
+#define HERALD_BROKER_MAX_FRAME_CEILING (4u * 1024u * 1024u)
+/* Late-join catch-up is independent of max_frame so 4096 rooms cannot pin GiBs. */
+#define HERALD_BROKER_DEFAULT_MAX_CATCHUP (256u * 1024u)
 #define HERALD_BROKER_DEFAULT_MAX_CONNS 8192
+#define HERALD_BROKER_MAX_CONNS_PER_IP 32
+#define HERALD_BROKER_IP_SLOTS 1024
+#define HERALD_BROKER_HANDSHAKE_TIMEOUT_MS 5000
+#define HERALD_BROKER_IDLE_TIMEOUT_MS 120000
+#define HERALD_BROKER_SEND_TIMEOUT_MS 15000
 #define HERALD_BROKER_MAX_ROOMS 4096
 #define HERALD_BROKER_MAX_PEERS_PER_ROOM 16
 #define HERALD_BROKER_MAX_ROOM_ID 128
@@ -146,8 +164,101 @@ static int broker_net_init(void) { return 1; }
 
 static int g_verbose = 0;
 static int g_max_conns = HERALD_BROKER_DEFAULT_MAX_CONNS; /* 0 = unlimited */
+static size_t g_max_catchup = HERALD_BROKER_DEFAULT_MAX_CATCHUP; /* 0 = disable */
 static int g_live_conns = 0;
 static pthread_mutex_t g_conn_mu = PTHREAD_MUTEX_INITIALIZER;
+static char g_origin_allow[512];
+static char g_host_allow[256];
+
+typedef struct {
+    uint32_t addr;
+    int n;
+} IpCount;
+static IpCount g_ip_counts[HERALD_BROKER_IP_SLOTS];
+
+static int broker_set_sock_timeouts(BrokerSock fd, int recv_ms, int send_ms) {
+#if defined(_WIN32)
+    DWORD r = (DWORD)recv_ms;
+    DWORD s = (DWORD)send_ms;
+    if (setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, (const char *)&r, sizeof(r)) != 0)
+        return 0;
+    if (setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, (const char *)&s, sizeof(s)) != 0)
+        return 0;
+    return 1;
+#else
+    struct timeval rtv, stv;
+    rtv.tv_sec = recv_ms / 1000;
+    rtv.tv_usec = (recv_ms % 1000) * 1000;
+    stv.tv_sec = send_ms / 1000;
+    stv.tv_usec = (send_ms % 1000) * 1000;
+    if (setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &rtv, sizeof(rtv)) != 0)
+        return 0;
+    if (setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &stv, sizeof(stv)) != 0)
+        return 0;
+    return 1;
+#endif
+}
+
+static int ip_try_admit(uint32_t addr) {
+    pthread_mutex_lock(&g_conn_mu);
+    int free_slot = -1;
+    for (int i = 0; i < HERALD_BROKER_IP_SLOTS; ++i) {
+        if (g_ip_counts[i].addr == addr && g_ip_counts[i].n > 0) {
+            if (g_ip_counts[i].n >= HERALD_BROKER_MAX_CONNS_PER_IP) {
+                pthread_mutex_unlock(&g_conn_mu);
+                return 0;
+            }
+            g_ip_counts[i].n++;
+            pthread_mutex_unlock(&g_conn_mu);
+            return 1;
+        }
+        if (free_slot < 0 && g_ip_counts[i].n == 0)
+            free_slot = i;
+    }
+    if (free_slot < 0) {
+        pthread_mutex_unlock(&g_conn_mu);
+        return 0;
+    }
+    g_ip_counts[free_slot].addr = addr;
+    g_ip_counts[free_slot].n = 1;
+    pthread_mutex_unlock(&g_conn_mu);
+    return 1;
+}
+
+static void ip_release(uint32_t addr) {
+    pthread_mutex_lock(&g_conn_mu);
+    for (int i = 0; i < HERALD_BROKER_IP_SLOTS; ++i) {
+        if (g_ip_counts[i].addr == addr && g_ip_counts[i].n > 0) {
+            g_ip_counts[i].n--;
+            if (g_ip_counts[i].n == 0)
+                g_ip_counts[i].addr = 0;
+            break;
+        }
+    }
+    pthread_mutex_unlock(&g_conn_mu);
+}
+
+static int header_list_contains(const char *list, const char *value) {
+    if (!list || !list[0] || !value || !value[0])
+        return 0;
+    const char *p = list;
+    size_t vlen = strlen(value);
+    while (*p) {
+        while (*p == ' ' || *p == '\t' || *p == ',')
+            ++p;
+        if (!*p)
+            break;
+        const char *start = p;
+        while (*p && *p != ',')
+            ++p;
+        size_t n = (size_t)(p - start);
+        while (n > 0 && (start[n - 1] == ' ' || start[n - 1] == '\t'))
+            --n;
+        if (n == vlen && strncasecmp(start, value, n) == 0)
+            return 1;
+    }
+    return 0;
+}
 
 /* Grow *buf to at least need bytes, capped at max_frame. */
 static int ensure_recv_cap(uint8_t **buf, size_t *cap, size_t need, size_t max_frame) {
@@ -486,6 +597,10 @@ static int ws_read_frame_header(BrokerSock fd, WsFrameHdr *out, size_t max_paylo
     }
     if (out->len > max_payload)
         return 0;
+    /* RFC 6455 §5.5: control frames MUST be ≤125 bytes and MUST NOT be fragmented. */
+    if ((out->opcode == 0x08 || out->opcode == 0x09 || out->opcode == 0x0A) &&
+        (!out->fin || out->len > 125))
+        return 0;
     return 1;
 }
 
@@ -702,12 +817,17 @@ static int ws_handshake_server(BrokerSock fd) {
     }
     /* Token-by-token header walk. We require Upgrade: websocket and a
      * Sec-WebSocket-Key, then answer with a spec-compliant Accept. */
-    int has_upgrade = 0, has_key = 0, has_version = 0, want_pmd = 0;
+    int has_upgrade = 0, has_key = 0, has_version13 = 0, has_connection = 0, want_pmd = 0;
     char key[64] = {0};
+    char origin[256] = {0};
+    char host[256] = {0};
     char *p = buf;
-    /* Skip the request line. */
+    /* Skip the request line. Require GET. */
     char *eol = strstr(p, "\r\n");
     if (!eol)
+        return 0;
+    *eol = '\0';
+    if (strncasecmp(p, "GET ", 4) != 0)
         return 0;
     p = eol + 2;
     while (p && *p && !(p[0] == '\r' && p[1] == '\n')) {
@@ -723,19 +843,30 @@ static int ws_handshake_server(BrokerSock fd) {
                 ++v;
             if (strcasecmp(p, "Upgrade") == 0 && broker_strcasestr(v, "websocket"))
                 has_upgrade = 1;
+            else if (strcasecmp(p, "Connection") == 0 && broker_strcasestr(v, "Upgrade"))
+                has_connection = 1;
             else if (strcasecmp(p, "Sec-WebSocket-Key") == 0) {
                 broker_copy_cstr(key, sizeof(key), v);
                 has_key = 1;
             } else if (strcasecmp(p, "Sec-WebSocket-Version") == 0) {
-                has_version = 1;
+                if (atoi(v) == 13)
+                    has_version13 = 1;
             } else if (strcasecmp(p, "Sec-WebSocket-Extensions") == 0) {
                 if (ws_extensions_offers_pmd(v))
                     want_pmd = 1;
+            } else if (strcasecmp(p, "Origin") == 0) {
+                broker_copy_cstr(origin, sizeof(origin), v);
+            } else if (strcasecmp(p, "Host") == 0) {
+                broker_copy_cstr(host, sizeof(host), v);
             }
         }
         p = next + 2;
     }
-    if (!has_upgrade || !has_key || !has_version)
+    if (!has_upgrade || !has_key || !has_version13 || !has_connection)
+        return 0;
+    if (g_origin_allow[0] && origin[0] && !header_list_contains(g_origin_allow, origin))
+        return 0;
+    if (g_host_allow[0] && (!host[0] || !header_list_contains(g_host_allow, host)))
         return 0;
     trim_ws_key(key);
     char accept[64];
@@ -775,16 +906,25 @@ static int ws_handshake_server(BrokerSock fd) {
 
 typedef struct Conn Conn;
 
+/* Open-addressed, linear probe. EMPTY stops a probe; TOMB does not.
+ * Evicting into EMPTY punches a hole: leave/disconnect never unlinks
+ * remaining Conn*, and a later JOIN/BROADCAST walks freed memory. */
+#define ROOM_SLOT_EMPTY 0
+#define ROOM_SLOT_LIVE 1
+#define ROOM_SLOT_TOMB 2
+
 typedef struct Room {
     char id[HERALD_BROKER_MAX_ROOM_ID];
     Conn *peers[HERALD_BROKER_MAX_PEERS_PER_ROOM];
     int peer_count;
     uint8_t *last_broadcast;
     size_t last_broadcast_len;
+    uint8_t slot; /* ROOM_SLOT_EMPTY / LIVE / TOMB */
 } Room;
 
 static Room g_rooms[HERALD_BROKER_MAX_ROOMS];
 static int g_room_count;
+static uint64_t g_next_peer_id = 1;
 static pthread_mutex_t g_rooms_mu = PTHREAD_MUTEX_INITIALIZER;
 
 static uint32_t room_hash(const char *id) {
@@ -798,23 +938,61 @@ static uint32_t room_hash(const char *id) {
     return h;
 }
 
-static Room *room_get_or_create_locked(const char *id) {
+static void room_assert_reusable(const Room *r) {
+    if (r->peer_count == 0 && r->last_broadcast == NULL)
+        return;
+    fprintf(stderr, "[broker] room slot reuse with peer_count=%d last_broadcast=%p\n",
+            r->peer_count, (void *)r->last_broadcast);
+    abort();
+}
+
+static Room *room_occupy_slot_locked(Room *dst, const char *id) {
+    room_assert_reusable(dst);
+    memset(dst->peers, 0, sizeof(dst->peers));
+    broker_copy_cstr(dst->id, sizeof(dst->id), id);
+    dst->peer_count = 0;
+    dst->last_broadcast = NULL;
+    dst->last_broadcast_len = 0;
+    dst->slot = ROOM_SLOT_LIVE;
+    g_room_count++;
+    return dst;
+}
+
+static Room *room_find_locked(const char *id) {
     uint32_t h = room_hash(id);
     for (uint32_t i = 0; i < HERALD_BROKER_MAX_ROOMS; ++i) {
         uint32_t idx = (h + i) % HERALD_BROKER_MAX_ROOMS;
-        if (g_rooms[idx].id[0] == '\0') {
-            /* Empty slot; create here. */
-            broker_copy_cstr(g_rooms[idx].id, sizeof(g_rooms[idx].id), id);
-            g_rooms[idx].peer_count = 0;
-            g_rooms[idx].last_broadcast = NULL;
-            g_rooms[idx].last_broadcast_len = 0;
-            g_room_count++;
-            return &g_rooms[idx];
-        }
+        uint8_t slot = g_rooms[idx].slot;
+        if (slot == ROOM_SLOT_EMPTY)
+            return NULL;
+        if (slot == ROOM_SLOT_TOMB)
+            continue;
         if (strcmp(g_rooms[idx].id, id) == 0)
             return &g_rooms[idx];
     }
-    return NULL; /* full */
+    return NULL;
+}
+
+static Room *room_get_or_create_locked(const char *id) {
+    uint32_t h = room_hash(id);
+    Room *tomb = NULL;
+    for (uint32_t i = 0; i < HERALD_BROKER_MAX_ROOMS; ++i) {
+        uint32_t idx = (h + i) % HERALD_BROKER_MAX_ROOMS;
+        Room *s = &g_rooms[idx];
+        if (s->slot == ROOM_SLOT_EMPTY)
+            return room_occupy_slot_locked(tomb ? tomb : s, id);
+        if (s->slot == ROOM_SLOT_TOMB) {
+            if (!tomb)
+                tomb = s;
+            continue;
+        }
+        if (strcmp(s->id, id) == 0)
+            return s;
+    }
+    /* No EMPTY in the table; reuse a tombstone if the probe hit one. */
+    if (tomb)
+        return room_occupy_slot_locked(tomb, id);
+    return NULL; /* full of live rooms */
 }
 
 static void room_evict_if_empty_locked(Room *r) {
@@ -825,7 +1003,9 @@ static void room_evict_if_empty_locked(Room *r) {
         r->last_broadcast = NULL;
         r->last_broadcast_len = 0;
     }
+    memset(r->peers, 0, sizeof(r->peers));
     r->id[0] = '\0';
+    r->slot = ROOM_SLOT_TOMB;
     g_room_count--;
 }
 
@@ -838,10 +1018,26 @@ struct Conn {
     char room_id[HERALD_BROKER_MAX_ROOM_ID];
     char name[HERALD_BROKER_MAX_NAME];
     uint64_t peer_id;
+    uint32_t peer_addr;
+    int refs;
     int closed;
     int pmd; /* 1 = permessage-deflate negotiated for this socket */
     size_t max_frame;
 };
+
+static void conn_ref(Conn *c) {
+    if (c)
+        (void)__sync_add_and_fetch(&c->refs, 1);
+}
+
+static void conn_unref(Conn *c) {
+    if (!c)
+        return;
+    if (__sync_sub_and_fetch(&c->refs, 1) == 0) {
+        pthread_mutex_destroy(&c->write_mu);
+        free(c);
+    }
+}
 
 /* Send an application payload; compress with RSV1 when PMD is on and
  * the deflate result is smaller. */
@@ -953,89 +1149,160 @@ static uint8_t *broker_build_relay_frame(uint8_t action, uint64_t sender_id, con
     return out;
 }
 
-/* Send a freshly-arrived broadcast to every other peer in the room, and
- * cache the broker-wrapped frame (with sender id) for late joiners. */
-static void fanout_broadcast(Room *r, Conn *src, const uint8_t *frame, size_t frame_len) {
-    if (frame_len < 1 || frame[0] != HERALD_ROOM_ACTION_BROADCAST)
-        return;
-    const uint8_t *app = frame + 1;
-    size_t app_len = frame_len - 1;
-    size_t relay_len = 0;
-    uint8_t *relay = broker_build_relay_frame(HERALD_ROOM_ACTION_BROADCAST, src->peer_id, app,
-                                              app_len, &relay_len);
-    if (!relay)
-        return;
-
-    if (r->last_broadcast) {
-        free(r->last_broadcast);
-        r->last_broadcast = NULL;
-    }
-    r->last_broadcast = relay;
-    r->last_broadcast_len = relay_len;
-
-    for (int i = 0; i < r->peer_count; ++i) {
-        Conn *c = r->peers[i];
-        if (c == src || c->closed)
+static uint64_t room_assign_peer_id_locked(Room *r) {
+    for (;;) {
+        uint64_t id = g_next_peer_id++;
+        if (id == 0)
             continue;
-        pthread_mutex_lock(&c->write_mu);
-        ws_send_binary(c, relay, relay_len);
-        pthread_mutex_unlock(&c->write_mu);
-    }
-}
-
-static void fanout_presence(Room *r, Conn *src, uint8_t kind) {
-    for (int i = 0; i < r->peer_count; ++i) {
-        Conn *c = r->peers[i];
-        if (c == src || c->closed)
-            continue;
-        conn_send_presence_locked(c, kind, src->peer_id, src->name);
-    }
-}
-
-static int conn_route_direct(Room *r, Conn *src, uint64_t dst_id, const uint8_t *app_payload,
-                             size_t app_payload_len) {
-    size_t relay_len = 0;
-    uint8_t *relay = broker_build_relay_frame(HERALD_ROOM_ACTION_DIRECT, src->peer_id, app_payload,
-                                              app_payload_len, &relay_len);
-    if (!relay)
-        return 0;
-    int ok = 0;
-    for (int i = 0; i < r->peer_count; ++i) {
-        Conn *c = r->peers[i];
-        if (c == src || c->closed)
-            continue;
-        if (c->peer_id == dst_id) {
-            pthread_mutex_lock(&c->write_mu);
-            ok = ws_send_binary(c, relay, relay_len);
-            pthread_mutex_unlock(&c->write_mu);
-            break;
+        int taken = 0;
+        for (int i = 0; i < r->peer_count; ++i) {
+            if (r->peers[i] && r->peers[i]->peer_id == id) {
+                taken = 1;
+                break;
+            }
         }
+        if (!taken)
+            return id;
+    }
+}
+
+static int room_snapshot_others_locked(Room *r, Conn *src, Conn **out, int out_cap) {
+    int n = 0;
+    for (int i = 0; i < r->peer_count && n < out_cap; ++i) {
+        Conn *c = r->peers[i];
+        if (!c || c == src || c->closed)
+            continue;
+        conn_ref(c);
+        out[n++] = c;
+    }
+    return n;
+}
+
+static void conn_snapshot_release(Conn **list, int n) {
+    for (int i = 0; i < n; ++i)
+        conn_unref(list[i]);
+}
+
+static int conn_send_join_ack(Conn *dst, uint64_t peer_id) {
+    uint8_t payload[1 + 8];
+    payload[0] = HERALD_ROOM_ACTION_JOIN_ACK;
+    wr_u64_le(payload + 1, peer_id);
+    pthread_mutex_lock(&dst->write_mu);
+    int ok = ws_send_binary(dst, payload, sizeof(payload));
+    pthread_mutex_unlock(&dst->write_mu);
+    return ok;
+}
+
+static int payload_starts_hcan(const uint8_t *app, size_t app_len) {
+    return app && app_len >= 4 && app[0] == 'H' && app[1] == 'C' && app[2] == 'A' && app[3] == 'N';
+}
+
+/* Caller holds g_rooms_mu. Copies the wire bytes, snapshots peers, then
+ * drops the lock before send. Always returns with g_rooms_mu unlocked. */
+static void fanout_broadcast(Room *r, Conn *src, const uint8_t *frame, size_t frame_len) {
+    uint8_t *wire = NULL;
+    size_t wire_len = 0;
+    Conn *snaps[HERALD_BROKER_MAX_PEERS_PER_ROOM];
+    int n = 0;
+    if (frame_len >= 1 && frame[0] == HERALD_ROOM_ACTION_BROADCAST) {
+        const uint8_t *app = frame + 1;
+        size_t app_len = frame_len - 1;
+        size_t relay_len = 0;
+        uint8_t *relay = broker_build_relay_frame(HERALD_ROOM_ACTION_BROADCAST, src->peer_id, app,
+                                                  app_len, &relay_len);
+        if (relay) {
+            int cache = !payload_starts_hcan(app, app_len) && relay_len <= g_max_catchup;
+            if (cache) {
+                if (r->last_broadcast)
+                    free(r->last_broadcast);
+                r->last_broadcast = relay;
+                r->last_broadcast_len = relay_len;
+                wire = (uint8_t *)malloc(relay_len);
+                if (wire) {
+                    memcpy(wire, relay, relay_len);
+                    wire_len = relay_len;
+                }
+            } else {
+                wire = relay;
+                wire_len = relay_len;
+            }
+            n = room_snapshot_others_locked(r, src, snaps, HERALD_BROKER_MAX_PEERS_PER_ROOM);
+        }
+    }
+    pthread_mutex_unlock(&g_rooms_mu);
+    for (int i = 0; i < n; ++i) {
+        Conn *peer = snaps[i];
+        if (wire && !peer->closed) {
+            pthread_mutex_lock(&peer->write_mu);
+            ws_send_binary(peer, wire, wire_len);
+            pthread_mutex_unlock(&peer->write_mu);
+        }
+    }
+    conn_snapshot_release(snaps, n);
+    free(wire);
+}
+
+static void send_presence_snapshot(Conn **snaps, int n, uint8_t kind, uint64_t peer_id,
+                                   const char *name) {
+    for (int i = 0; i < n; ++i)
+        conn_send_presence_locked(snaps[i], kind, peer_id, name);
+    conn_snapshot_release(snaps, n);
+}
+
+/* Caller holds g_rooms_mu. Drops it before send. */
+static int conn_route_action(Room *r, Conn *src, uint8_t action, uint64_t dst_id,
+                             const uint8_t *app_payload, size_t app_payload_len) {
+    size_t relay_len = 0;
+    uint8_t *relay = broker_build_relay_frame(action, src->peer_id, app_payload, app_payload_len,
+                                              &relay_len);
+    Conn *dst = NULL;
+    if (relay) {
+        for (int i = 0; i < r->peer_count; ++i) {
+            Conn *peer = r->peers[i];
+            if (peer == src || peer->closed)
+                continue;
+            if (peer->peer_id == dst_id) {
+                dst = peer;
+                conn_ref(dst);
+                break;
+            }
+        }
+    }
+    pthread_mutex_unlock(&g_rooms_mu);
+    int ok = 0;
+    if (dst && relay) {
+        pthread_mutex_lock(&dst->write_mu);
+        ok = ws_send_binary(dst, relay, relay_len);
+        pthread_mutex_unlock(&dst->write_mu);
+        conn_unref(dst);
     }
     free(relay);
     return ok;
 }
 
-static void conn_leave_room_locked(Conn *c) {
+/* Unlink from the room. If remaining peers need PRESENCE_LEAVE, snapshot them
+ * (refs held). Caller sends after dropping g_rooms_mu. */
+static int conn_leave_room_locked(Conn *c, Conn **snaps, int snap_cap, uint64_t *leave_id,
+                                  char *leave_name, size_t name_cap) {
+    int n = 0;
+    if (leave_id)
+        *leave_id = c->peer_id;
+    if (leave_name && name_cap)
+        broker_copy_cstr(leave_name, name_cap, c->name);
     if (c->room_id[0] == '\0')
-        return;
-    uint32_t h = room_hash(c->room_id);
-    for (uint32_t i = 0; i < HERALD_BROKER_MAX_ROOMS; ++i) {
-        uint32_t idx = (h + i) % HERALD_BROKER_MAX_ROOMS;
-        if (g_rooms[idx].id[0] == '\0')
-            return;
-        if (strcmp(g_rooms[idx].id, c->room_id) == 0) {
-            conn_remove_peer_locked(&g_rooms[idx], c);
-            if (g_rooms[idx].peer_count > 0) {
-                fanout_presence(&g_rooms[idx], c, /*HERALD_PRESENCE_LEAVE*/ 1);
-            } else {
-                room_evict_if_empty_locked(&g_rooms[idx]);
-            }
-            c->room_id[0] = '\0';
-            c->name[0] = '\0';
-            c->peer_id = 0;
-            return;
-        }
+        return 0;
+    Room *r = room_find_locked(c->room_id);
+    if (r) {
+        conn_remove_peer_locked(r, c);
+        if (r->peer_count > 0 && snaps)
+            n = room_snapshot_others_locked(r, c, snaps, snap_cap);
+        else
+            room_evict_if_empty_locked(r);
     }
+    c->room_id[0] = '\0';
+    c->name[0] = '\0';
+    c->peer_id = 0;
+    return n;
 }
 
 /* Parse and dispatch a single room-action frame. `frame` is the WS
@@ -1058,6 +1325,8 @@ static int conn_dispatch_frame(Conn *c, const uint8_t *frame, size_t len) {
             return 0;
         if (room_len == 0 || room_len >= HERALD_BROKER_MAX_ROOM_ID)
             return 0;
+        if (memchr(p, 0, room_len))
+            return 0;
         char room_id[HERALD_BROKER_MAX_ROOM_ID] = {0};
         memcpy(room_id, p, room_len);
         p += room_len;
@@ -1078,98 +1347,107 @@ static int conn_dispatch_frame(Conn *c, const uint8_t *frame, size_t len) {
         pl -= name_len;
         if (pl < 8)
             return 0;
-        uint64_t peer_id = rd_u64_le(p);
+        (void)rd_u64_le(p); /* client-chosen id is ignored */
+
+        Conn *leave_snaps[HERALD_BROKER_MAX_PEERS_PER_ROOM];
+        int nleave = 0;
+        uint64_t leave_id = 0;
+        char leave_name[HERALD_BROKER_MAX_NAME];
+        leave_name[0] = '\0';
+        Conn *join_snaps[HERALD_BROKER_MAX_PEERS_PER_ROOM];
+        int njoin = 0;
+        uint8_t *catchup = NULL;
+        size_t catchup_len = 0;
+        uint64_t assigned = 0;
+        int join_peers = 0;
 
         pthread_mutex_lock(&g_rooms_mu);
-        if (c->room_id[0]) {
-            /* Already in a room; treat as leave+join. */
-            conn_leave_room_locked(c);
-        }
+        if (c->room_id[0])
+            nleave = conn_leave_room_locked(c, leave_snaps, HERALD_BROKER_MAX_PEERS_PER_ROOM,
+                                            &leave_id, leave_name, sizeof(leave_name));
         Room *r = room_get_or_create_locked(room_id);
         if (!r) {
             pthread_mutex_unlock(&g_rooms_mu);
+            send_presence_snapshot(leave_snaps, nleave, 1, leave_id, leave_name);
             broker_log("room table full; rejecting join");
             (void)conn_send_error(c, HERALD_ROOM_ERR_ROOM_TABLE_FULL, "room table full");
             return 0;
         }
         if (!conn_add_peer_locked(r, c)) {
             pthread_mutex_unlock(&g_rooms_mu);
+            send_presence_snapshot(leave_snaps, nleave, 1, leave_id, leave_name);
             broker_log("peer cap on room '%s' reached", room_id);
             (void)conn_send_error(c, HERALD_ROOM_ERR_ROOM_FULL, "room full");
             return 0;
         }
+        assigned = room_assign_peer_id_locked(r);
         broker_copy_cstr(c->room_id, sizeof(c->room_id), room_id);
         broker_copy_cstr(c->name, sizeof(c->name), name);
-        c->peer_id = peer_id;
-
-        /* 1. Replay the cached last BROADCAST to the new joiner. */
+        c->peer_id = assigned;
+        join_peers = r->peer_count;
         if (r->last_broadcast && r->last_broadcast_len > 0) {
-            conn_send_buffered_broadcast(c, r->last_broadcast, r->last_broadcast_len);
+            catchup = (uint8_t *)malloc(r->last_broadcast_len);
+            if (catchup) {
+                memcpy(catchup, r->last_broadcast, r->last_broadcast_len);
+                catchup_len = r->last_broadcast_len;
+            }
         }
-        /* 2. Tell the joiner who is already here. */
-        for (int i = 0; i < r->peer_count; ++i) {
-            Conn *other = r->peers[i];
-            if (other == c || other->closed)
-                continue;
-            conn_send_presence_locked(c, /*HERALD_PRESENCE_JOIN*/ 0, other->peer_id, other->name);
-        }
-        /* 3. Announce the new joiner to the survivors. */
-        fanout_presence(r, c, /*HERALD_PRESENCE_JOIN*/ 0);
+        njoin = room_snapshot_others_locked(r, c, join_snaps, HERALD_BROKER_MAX_PEERS_PER_ROOM);
         pthread_mutex_unlock(&g_rooms_mu);
-        broker_log("peer %lu joined '%s' as '%s' (now %d peers)", (unsigned long)peer_id, room_id,
-                   name, r->peer_count);
+
+        send_presence_snapshot(leave_snaps, nleave, 1, leave_id, leave_name);
+        (void)conn_send_join_ack(c, assigned);
+        if (catchup && catchup_len)
+            conn_send_buffered_broadcast(c, catchup, catchup_len);
+        free(catchup);
+        for (int i = 0; i < njoin; ++i) {
+            Conn *other = join_snaps[i];
+            conn_send_presence_locked(c, /*HERALD_PRESENCE_JOIN*/ 0, other->peer_id, other->name);
+            conn_send_presence_locked(other, /*HERALD_PRESENCE_JOIN*/ 0, assigned, name);
+        }
+        conn_snapshot_release(join_snaps, njoin);
+        broker_log("peer %lu joined '%s' as '%s' (now %d peers)", (unsigned long)assigned, room_id,
+                   name, join_peers);
         return 1;
     }
     case HERALD_ROOM_ACTION_LEAVE_ROOM: {
+        Conn *snaps[HERALD_BROKER_MAX_PEERS_PER_ROOM];
+        uint64_t leave_id = 0;
+        char leave_name[HERALD_BROKER_MAX_NAME];
         pthread_mutex_lock(&g_rooms_mu);
-        conn_leave_room_locked(c);
+        int n = conn_leave_room_locked(c, snaps, HERALD_BROKER_MAX_PEERS_PER_ROOM, &leave_id,
+                                       leave_name, sizeof(leave_name));
         pthread_mutex_unlock(&g_rooms_mu);
+        send_presence_snapshot(snaps, n, 1, leave_id, leave_name);
         return 1;
     }
     case HERALD_ROOM_ACTION_BROADCAST: {
         if (c->room_id[0] == '\0')
             return 1; /* ignore broadcast from un-joined peer */
         pthread_mutex_lock(&g_rooms_mu);
-        Room *r = NULL;
-        uint32_t h = room_hash(c->room_id);
-        for (uint32_t i = 0; i < HERALD_BROKER_MAX_ROOMS; ++i) {
-            uint32_t idx = (h + i) % HERALD_BROKER_MAX_ROOMS;
-            if (g_rooms[idx].id[0] == '\0')
-                break;
-            if (strcmp(g_rooms[idx].id, c->room_id) == 0) {
-                r = &g_rooms[idx];
-                break;
-            }
-        }
+        Room *r = room_find_locked(c->room_id);
         if (r) {
             broker_log("broadcast %zu bytes from peer %lu in room '%s'", len,
                        (unsigned long)c->peer_id, c->room_id);
             fanout_broadcast(r, c, frame, len);
+        } else {
+            pthread_mutex_unlock(&g_rooms_mu);
         }
-        pthread_mutex_unlock(&g_rooms_mu);
         return 1;
     }
-    case HERALD_ROOM_ACTION_DIRECT: {
+    case HERALD_ROOM_ACTION_DIRECT:
+    case HERALD_ROOM_ACTION_SIGNAL: {
         if (pl < 8 || c->room_id[0] == '\0')
             return 1;
         uint64_t dst = rd_u64_le(p);
         const uint8_t *payload = p + 8;
         size_t payload_len = pl - 8;
         pthread_mutex_lock(&g_rooms_mu);
-        Room *r = NULL;
-        uint32_t h = room_hash(c->room_id);
-        for (uint32_t i = 0; i < HERALD_BROKER_MAX_ROOMS; ++i) {
-            uint32_t idx = (h + i) % HERALD_BROKER_MAX_ROOMS;
-            if (g_rooms[idx].id[0] == '\0')
-                break;
-            if (strcmp(g_rooms[idx].id, c->room_id) == 0) {
-                r = &g_rooms[idx];
-                break;
-            }
-        }
+        Room *r = room_find_locked(c->room_id);
         if (r)
-            (void)conn_route_direct(r, c, dst, payload, payload_len);
-        pthread_mutex_unlock(&g_rooms_mu);
+            (void)conn_route_action(r, c, action, dst, payload, payload_len);
+        else
+            pthread_mutex_unlock(&g_rooms_mu);
         return 1;
     }
     default:
@@ -1182,11 +1460,15 @@ static int conn_dispatch_frame(Conn *c, const uint8_t *frame, size_t len) {
 
 static void *conn_thread_main(void *arg) {
     Conn *c = (Conn *)arg;
+    (void)broker_set_sock_timeouts(c->fd, HERALD_BROKER_HANDSHAKE_TIMEOUT_MS,
+                                   HERALD_BROKER_SEND_TIMEOUT_MS);
     int hs = ws_handshake_server(c->fd);
     if (!hs) {
         broker_log("handshake failed; closing fd %d", (int)c->fd);
         goto done;
     }
+    (void)broker_set_sock_timeouts(c->fd, HERALD_BROKER_IDLE_TIMEOUT_MS,
+                                   HERALD_BROKER_SEND_TIMEOUT_MS);
     c->pmd = (hs == 2) ? 1 : 0;
     if (c->pmd)
         broker_log("fd %d negotiated permessage-deflate", (int)c->fd);
@@ -1203,6 +1485,10 @@ static void *conn_thread_main(void *arg) {
         WsFrameHdr h;
         if (!ws_read_frame_header(c->fd, &h, c->max_frame))
             break;
+        if (!h.masked) {
+            broker_log("unmasked client frame; closing");
+            break;
+        }
         /* Control frames must not set RSV1. */
         if ((h.opcode == 0x08 || h.opcode == 0x09 || h.opcode == 0x0A) && h.rsv1) {
             broker_log("RSV1 on control frame; closing");
@@ -1261,8 +1547,8 @@ static void *conn_thread_main(void *arg) {
             pthread_mutex_unlock(&c->write_mu);
             break;
         }
-        /* App data: reassemble BINARY/TEXT fragments (FIN=0 … FIN=1). */
-        if (h.opcode != 0x02 && h.opcode != 0x01) {
+        /* App data: reassemble BINARY fragments (FIN=0 … FIN=1). TEXT is rejected. */
+        if (h.opcode != 0x02) {
             broker_log("unsupported opcode 0x%x; closing", h.opcode);
             break;
         }
@@ -1333,12 +1619,19 @@ free_payload:
     free(payload);
 done:
     c->closed = 1;
-    pthread_mutex_lock(&g_rooms_mu);
-    conn_leave_room_locked(c);
-    pthread_mutex_unlock(&g_rooms_mu);
+    {
+        Conn *snaps[HERALD_BROKER_MAX_PEERS_PER_ROOM];
+        uint64_t leave_id = 0;
+        char leave_name[HERALD_BROKER_MAX_NAME];
+        pthread_mutex_lock(&g_rooms_mu);
+        int n = conn_leave_room_locked(c, snaps, HERALD_BROKER_MAX_PEERS_PER_ROOM, &leave_id,
+                                       leave_name, sizeof(leave_name));
+        pthread_mutex_unlock(&g_rooms_mu);
+        send_presence_snapshot(snaps, n, 1, leave_id, leave_name);
+    }
     broker_close(c->fd);
-    pthread_mutex_destroy(&c->write_mu);
-    free(c);
+    ip_release(c->peer_addr);
+    conn_unref(c);
     conn_count_dec();
     return NULL;
 }
@@ -1363,6 +1656,16 @@ int main(void) {
     size_t max_frame = mf_env ? (size_t)strtoul(mf_env, NULL, 10) : HERALD_BROKER_DEFAULT_MAX_FRAME;
     if (max_frame == 0)
         max_frame = HERALD_BROKER_DEFAULT_MAX_FRAME;
+    if (max_frame > HERALD_BROKER_MAX_FRAME_CEILING)
+        max_frame = HERALD_BROKER_MAX_FRAME_CEILING;
+
+    const char *cu_env = getenv("HERALD_BROKER_MAX_CATCHUP");
+    if (cu_env && cu_env[0]) {
+        /* Explicit 0 = do not store last_broadcast. */
+        g_max_catchup = (size_t)strtoul(cu_env, NULL, 10);
+        if (g_max_catchup > max_frame)
+            g_max_catchup = max_frame;
+    }
 
     const char *mc_env = getenv("HERALD_BROKER_MAX_CONNECTIONS");
     if (mc_env && mc_env[0]) {
@@ -1374,6 +1677,31 @@ int main(void) {
 
     const char *vb = getenv("HERALD_BROKER_VERBOSE");
     g_verbose = (vb && vb[0] != '0') ? 1 : 0;
+
+    const char *origin_env = getenv("HERALD_BROKER_ORIGIN");
+    if (origin_env)
+        broker_copy_cstr(g_origin_allow, sizeof(g_origin_allow), origin_env);
+    const char *host_env = getenv("HERALD_BROKER_HOST");
+    if (host_env)
+        broker_copy_cstr(g_host_allow, sizeof(g_host_allow), host_env);
+
+    const char *bind_env = getenv("HERALD_BROKER_BIND");
+    uint32_t bind_addr = htonl(INADDR_LOOPBACK);
+    const char *bind_label = "127.0.0.1";
+    if (bind_env && bind_env[0]) {
+        if (strcmp(bind_env, "0.0.0.0") == 0 || strcmp(bind_env, "*") == 0) {
+            bind_addr = htonl(INADDR_ANY);
+            bind_label = "0.0.0.0";
+        } else {
+            bind_addr = inet_addr(bind_env);
+            if (bind_addr == (uint32_t)INADDR_NONE) {
+                bind_addr = htonl(INADDR_LOOPBACK);
+                bind_label = "127.0.0.1";
+            } else {
+                bind_label = bind_env;
+            }
+        }
+    }
 
     size_t stack_sz = HERALD_BROKER_THREAD_STACK;
 #ifdef PTHREAD_STACK_MIN
@@ -1391,7 +1719,7 @@ int main(void) {
     struct sockaddr_in addr;
     memset(&addr, 0, sizeof(addr));
     addr.sin_family = AF_INET;
-    addr.sin_addr.s_addr = htonl(INADDR_ANY);
+    addr.sin_addr.s_addr = bind_addr;
     addr.sin_port = htons((uint16_t)port);
     if (bind(srv, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
         fprintf(stderr, "bind: error %d\n", broker_sock_err());
@@ -1401,8 +1729,8 @@ int main(void) {
         fprintf(stderr, "listen: error %d\n", broker_sock_err());
         return 1;
     }
-    fprintf(stderr, "[broker] listening on 0.0.0.0:%d (max_frame=%zu max_conns=%d stack=%zu)\n",
-            port, max_frame, g_max_conns, stack_sz);
+    fprintf(stderr, "[broker] listening on %s:%d (max_frame=%zu max_catchup=%zu max_conns=%d stack=%zu)\n",
+            bind_label, port, max_frame, g_max_catchup, g_max_conns, stack_sz);
 
     for (;;) {
         struct sockaddr_in caddr;
@@ -1414,19 +1742,29 @@ int main(void) {
             fprintf(stderr, "accept: error %d\n", broker_sock_err());
             continue;
         }
+        uint32_t ip = caddr.sin_addr.s_addr;
         if (!conn_try_admit()) {
             broker_log("max connections (%d); rejecting", g_max_conns);
             broker_close(cfd);
             continue;
         }
+        if (!ip_try_admit(ip)) {
+            broker_log("per-ip cap (%d); rejecting", HERALD_BROKER_MAX_CONNS_PER_IP);
+            broker_close(cfd);
+            conn_count_dec();
+            continue;
+        }
         Conn *c = (Conn *)calloc(1, sizeof(Conn));
         if (!c) {
             broker_close(cfd);
+            ip_release(ip);
             conn_count_dec();
             continue;
         }
         c->fd = cfd;
         c->max_frame = max_frame;
+        c->peer_addr = ip;
+        c->refs = 1;
         pthread_mutex_init(&c->write_mu, NULL);
 
         pthread_attr_t attr;
@@ -1438,8 +1776,8 @@ int main(void) {
             if (attr_ok)
                 pthread_attr_destroy(&attr);
             broker_close(cfd);
-            pthread_mutex_destroy(&c->write_mu);
-            free(c);
+            ip_release(ip);
+            conn_unref(c);
             conn_count_dec();
             continue;
         }
