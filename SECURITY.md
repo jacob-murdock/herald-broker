@@ -20,10 +20,13 @@ Prefer private email over public issues for unfixed bugs. Coordinated disclosure
 ## Hardening already present
 
 - Max frame size (`HERALD_BROKER_MAX_FRAME`).
+- Late-join catch-up cap (`HERALD_BROKER_MAX_CATCHUP`; default 256 KiB, independent of max frame).
 - Max live connections (`HERALD_BROKER_MAX_CONNECTIONS`; default 8192; reject + close when full).
 - Room table cap and peers-per-room cap.
+- Room map tombstones: evicting a colliding room does not hide later probe-chain occupants (leave still unlinks `Conn *`).
 - No disk persistence of room traffic; no room-list endpoint.
 - Permessage-deflate uses one-shot inflate/deflate (`no_context_takeover`).
+- Docker image runs as uid 65532 (`herald`), not root.
 
 ## Recommended ops
 

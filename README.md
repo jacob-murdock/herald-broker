@@ -33,6 +33,7 @@ Docker (build context = this directory):
 docker build -t herald-broker .
 docker run --rm -p 8787:8787 --ulimit nofile=65535:65535 \
   -e HERALD_BROKER_VERBOSE=0 herald-broker
+# Process uid is 65532 (non-root).
 ```
 
 ### Env
@@ -40,8 +41,12 @@ docker run --rm -p 8787:8787 --ulimit nofile=65535:65535 \
 | Variable | Default | Meaning |
 |----------|---------|---------|
 | `HERALD_BROKER_PORT` | `8787` | Listen port |
-| `HERALD_BROKER_MAX_FRAME` | `1048576` (1 MiB) | Max WS payload |
+| `HERALD_BROKER_BIND` | `127.0.0.1` | Bind address (`0.0.0.0` for all interfaces) |
+| `HERALD_BROKER_MAX_FRAME` | `1048576` (1 MiB) | Max WS payload (clamped at 4 MiB) |
+| `HERALD_BROKER_MAX_CATCHUP` | `262144` (256 KiB) | Max `last_broadcast` stored per room; `0` = none |
 | `HERALD_BROKER_MAX_CONNECTIONS` | `8192` | Live sockets before accept-shed; `0` = unlimited |
+| `HERALD_BROKER_ORIGIN` | unset | If set, a present `Origin` header must match (comma-list) |
+| `HERALD_BROKER_HOST` | unset | If set, `Host` header must match |
 | `HERALD_BROKER_VERBOSE` | `0` | `1` = stderr metadata logs |
 
 Raise the process `nofile` limit to at least `MAX_CONNECTIONS` (container image tries `ulimit -n 65535`; pass `--ulimit nofile=65535:65535` when the platform hard-caps lower).
