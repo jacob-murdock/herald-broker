@@ -5,7 +5,7 @@
  * binary frames between clients in the same room; never parses egregore
  * payloads. POSIX sockets or Winsock + libpthread.
  *
- * Wire (herald_room.h v1; JOIN peer_id tail is ignored — broker assigns):
+ * Wire (herald_room.h v1; JOIN peer_id is a reconnect hint):
  *   JOIN_ROOM  0x01  [u16 LE room_id_len, room_id, u16 LE name_len, name, u64 LE peer_id]
  *   LEAVE_ROOM 0x02
  *   JOIN_ACK   0x03  [u64 LE assigned_peer_id]  (broker → joiner)
@@ -19,9 +19,12 @@
  *   ERROR      0x30  [u8 code, u16 LE msg_len, msg…]  (broker → client; reject JOIN)
  *
  * Behavior:
- *   JOIN_ROOM   — assign a unique peer id, JOIN_ACK the joiner, broadcast
- *                 PRESENCE_JOIN to others, send cached last BROADCAST
- *                 (late-join catch-up). On peer/room-table cap: ERROR then close.
+ *   JOIN_ROOM   — same-connection JOIN to the same room is a rename (keep
+ *                 peer id, fan out PRESENCE_JOIN with the new name). Otherwise
+ *                 assign a unique peer id (reuse the JOIN hint if free),
+ *                 JOIN_ACK the joiner, broadcast PRESENCE_JOIN to others, send
+ *                 cached last BROADCAST (late-join catch-up). On peer/room-table
+ *                 cap: ERROR then close.
  *   LEAVE_ROOM  — remove, broadcast PRESENCE_LEAVE to survivors.
  *   BROADCAST   — forward to all other peers, cache bytes for late joiners
  *                 (not HCAN / SIGNAL).
@@ -1149,21 +1152,33 @@ static uint8_t *broker_build_relay_frame(uint8_t action, uint64_t sender_id, con
     return out;
 }
 
+static int room_peer_id_in_use_locked(const Room *r, uint64_t id) {
+    if (!r || id == 0)
+        return 0;
+    for (int i = 0; i < r->peer_count; ++i) {
+        if (r->peers[i] && r->peers[i]->peer_id == id)
+            return 1;
+    }
+    return 0;
+}
+
 static uint64_t room_assign_peer_id_locked(Room *r) {
     for (;;) {
         uint64_t id = g_next_peer_id++;
         if (id == 0)
             continue;
-        int taken = 0;
-        for (int i = 0; i < r->peer_count; ++i) {
-            if (r->peers[i] && r->peers[i]->peer_id == id) {
-                taken = 1;
-                break;
-            }
-        }
-        if (!taken)
+        if (!room_peer_id_in_use_locked(r, id))
             return id;
     }
+}
+
+static uint64_t room_take_peer_id_locked(Room *r, uint64_t requested) {
+    if (requested != 0 && !room_peer_id_in_use_locked(r, requested)) {
+        if (requested >= g_next_peer_id)
+            g_next_peer_id = requested + 1;
+        return requested;
+    }
+    return room_assign_peer_id_locked(r);
 }
 
 static int room_snapshot_others_locked(Room *r, Conn *src, Conn **out, int out_cap) {
@@ -1347,7 +1362,7 @@ static int conn_dispatch_frame(Conn *c, const uint8_t *frame, size_t len) {
         pl -= name_len;
         if (pl < 8)
             return 0;
-        (void)rd_u64_le(p); /* client-chosen id is ignored */
+        uint64_t requested = rd_u64_le(p);
 
         Conn *leave_snaps[HERALD_BROKER_MAX_PEERS_PER_ROOM];
         int nleave = 0;
@@ -1362,6 +1377,29 @@ static int conn_dispatch_frame(Conn *c, const uint8_t *frame, size_t len) {
         int join_peers = 0;
 
         pthread_mutex_lock(&g_rooms_mu);
+        /* Display-name updates re-JOIN on the same socket. Leaving and minting
+         * a new id turned every keystroke into a ghost Members row. */
+        if (c->room_id[0] && strcmp(c->room_id, room_id) == 0) {
+            Room *cur = room_find_locked(c->room_id);
+            int name_changed = strcmp(c->name, name) != 0;
+            broker_copy_cstr(c->name, sizeof(c->name), name);
+            assigned = c->peer_id;
+            join_peers = cur ? cur->peer_count : 0;
+            if (cur)
+                njoin = room_snapshot_others_locked(cur, c, join_snaps,
+                                                    HERALD_BROKER_MAX_PEERS_PER_ROOM);
+            pthread_mutex_unlock(&g_rooms_mu);
+            (void)conn_send_join_ack(c, assigned);
+            if (name_changed) {
+                for (int i = 0; i < njoin; ++i)
+                    conn_send_presence_locked(join_snaps[i], /*HERALD_PRESENCE_JOIN*/ 0, assigned,
+                                              name);
+            }
+            conn_snapshot_release(join_snaps, njoin);
+            broker_log("peer %lu renamed in '%s' to '%s' (now %d peers)", (unsigned long)assigned,
+                       room_id, name, join_peers);
+            return 1;
+        }
         if (c->room_id[0])
             nleave = conn_leave_room_locked(c, leave_snaps, HERALD_BROKER_MAX_PEERS_PER_ROOM,
                                             &leave_id, leave_name, sizeof(leave_name));
@@ -1380,7 +1418,7 @@ static int conn_dispatch_frame(Conn *c, const uint8_t *frame, size_t len) {
             (void)conn_send_error(c, HERALD_ROOM_ERR_ROOM_FULL, "room full");
             return 0;
         }
-        assigned = room_assign_peer_id_locked(r);
+        assigned = room_take_peer_id_locked(r, requested);
         broker_copy_cstr(c->room_id, sizeof(c->room_id), room_id);
         broker_copy_cstr(c->name, sizeof(c->name), name);
         c->peer_id = assigned;
