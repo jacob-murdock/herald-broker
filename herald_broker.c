@@ -38,6 +38,8 @@
  *   HERALD_BROKER_MAX_FRAME        (default 1 MiB; clamped to 4 MiB)
  *   HERALD_BROKER_MAX_CATCHUP      (default 256 KiB; 0 = no last_broadcast)
  *   HERALD_BROKER_MAX_CONNECTIONS  (default 8192; 0 = unlimited)
+ *   HERALD_BROKER_MAX_CONNS_PER_IP (default 0 = unlimited; set 32 to restore
+ *                                   the former hard cap for direct exposure)
  *   HERALD_BROKER_ORIGIN           (optional comma-list; if set, a present
  *                                   Origin header must match one entry)
  *   HERALD_BROKER_HOST             (optional; if set, Host header must match)
@@ -145,7 +147,6 @@ static int broker_net_init(void) { return 1; }
 /* Late-join catch-up is independent of max_frame so 4096 rooms cannot pin GiBs. */
 #define HERALD_BROKER_DEFAULT_MAX_CATCHUP (256u * 1024u)
 #define HERALD_BROKER_DEFAULT_MAX_CONNS 8192
-#define HERALD_BROKER_MAX_CONNS_PER_IP 32
 #define HERALD_BROKER_IP_SLOTS 1024
 #define HERALD_BROKER_HANDSHAKE_TIMEOUT_MS 5000
 #define HERALD_BROKER_IDLE_TIMEOUT_MS 120000
@@ -167,6 +168,7 @@ static int broker_net_init(void) { return 1; }
 
 static int g_verbose = 0;
 static int g_max_conns = HERALD_BROKER_DEFAULT_MAX_CONNS; /* 0 = unlimited */
+static int g_max_conns_per_ip = 0; /* 0 = unlimited */
 static size_t g_max_catchup = HERALD_BROKER_DEFAULT_MAX_CATCHUP; /* 0 = disable */
 static int g_live_conns = 0;
 static pthread_mutex_t g_conn_mu = PTHREAD_MUTEX_INITIALIZER;
@@ -203,11 +205,13 @@ static int broker_set_sock_timeouts(BrokerSock fd, int recv_ms, int send_ms) {
 }
 
 static int ip_try_admit(uint32_t addr) {
+    if (g_max_conns_per_ip <= 0)
+        return 1;
     pthread_mutex_lock(&g_conn_mu);
     int free_slot = -1;
     for (int i = 0; i < HERALD_BROKER_IP_SLOTS; ++i) {
         if (g_ip_counts[i].addr == addr && g_ip_counts[i].n > 0) {
-            if (g_ip_counts[i].n >= HERALD_BROKER_MAX_CONNS_PER_IP) {
+            if (g_ip_counts[i].n >= g_max_conns_per_ip) {
                 pthread_mutex_unlock(&g_conn_mu);
                 return 0;
             }
@@ -229,6 +233,8 @@ static int ip_try_admit(uint32_t addr) {
 }
 
 static void ip_release(uint32_t addr) {
+    if (g_max_conns_per_ip <= 0)
+        return;
     pthread_mutex_lock(&g_conn_mu);
     for (int i = 0; i < HERALD_BROKER_IP_SLOTS; ++i) {
         if (g_ip_counts[i].addr == addr && g_ip_counts[i].n > 0) {
@@ -1713,6 +1719,14 @@ int main(void) {
             g_max_conns = HERALD_BROKER_DEFAULT_MAX_CONNS;
     }
 
+    const char *mci_env = getenv("HERALD_BROKER_MAX_CONNS_PER_IP");
+    if (mci_env && mci_env[0]) {
+        /* Explicit 0 = unlimited; missing env keeps the default. */
+        g_max_conns_per_ip = (int)strtol(mci_env, NULL, 10);
+        if (g_max_conns_per_ip < 0)
+            g_max_conns_per_ip = 0;
+    }
+
     const char *vb = getenv("HERALD_BROKER_VERBOSE");
     g_verbose = (vb && vb[0] != '0') ? 1 : 0;
 
@@ -1767,8 +1781,11 @@ int main(void) {
         fprintf(stderr, "listen: error %d\n", broker_sock_err());
         return 1;
     }
-    fprintf(stderr, "[broker] listening on %s:%d (max_frame=%zu max_catchup=%zu max_conns=%d stack=%zu)\n",
-            bind_label, port, max_frame, g_max_catchup, g_max_conns, stack_sz);
+    fprintf(stderr,
+            "[broker] listening on %s:%d (max_frame=%zu max_catchup=%zu max_conns=%d "
+            "max_conns_per_ip=%d stack=%zu)\n",
+            bind_label, port, max_frame, g_max_catchup, g_max_conns, g_max_conns_per_ip,
+            stack_sz);
 
     for (;;) {
         struct sockaddr_in caddr;
@@ -1787,7 +1804,7 @@ int main(void) {
             continue;
         }
         if (!ip_try_admit(ip)) {
-            broker_log("per-ip cap (%d); rejecting", HERALD_BROKER_MAX_CONNS_PER_IP);
+            broker_log("per-ip cap (%d); rejecting", g_max_conns_per_ip);
             broker_close(cfd);
             conn_count_dec();
             continue;

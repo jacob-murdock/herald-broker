@@ -45,11 +45,14 @@ docker run --rm -p 8787:8787 --ulimit nofile=65535:65535 \
 | `HERALD_BROKER_MAX_FRAME` | `1048576` (1 MiB) | Max WS payload (clamped at 4 MiB) |
 | `HERALD_BROKER_MAX_CATCHUP` | `262144` (256 KiB) | Max `last_broadcast` stored per room; `0` = none |
 | `HERALD_BROKER_MAX_CONNECTIONS` | `8192` | Live sockets before accept-shed; `0` = unlimited |
+| `HERALD_BROKER_MAX_CONNS_PER_IP` | `0` (unlimited) | Max live sockets per TCP peer address; set `32` to restore the former hard cap |
 | `HERALD_BROKER_ORIGIN` | unset | If set, a present `Origin` header must match (comma-list) |
 | `HERALD_BROKER_HOST` | unset | If set, `Host` header must match |
 | `HERALD_BROKER_VERBOSE` | `0` | `1` = stderr metadata logs |
 
 Raise the process `nofile` limit to at least `MAX_CONNECTIONS` (container image tries `ulimit -n 65535`; pass `--ulimit nofile=65535:65535` when the platform hard-caps lower).
+
+**Reverse-proxy / TLS terminator:** the broker sees every client as the proxy's source IP. The default per-IP cap is unlimited (`HERALD_BROKER_MAX_CONNS_PER_IP=0`); global `HERALD_BROKER_MAX_CONNECTIONS` still applies. To re-enable a strict per-IP limit in-process, set `HERALD_BROKER_MAX_CONNS_PER_IP=32` (or another value) — or rate-limit at the proxy.
 
 ## Wire protocol
 
