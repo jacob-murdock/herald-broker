@@ -22,6 +22,7 @@ Prefer private email over public issues for unfixed bugs. Coordinated disclosure
 - Max frame size (`HERALD_BROKER_MAX_FRAME`).
 - Late-join catch-up cap (`HERALD_BROKER_MAX_CATCHUP`; default 256 KiB, independent of max frame).
 - Max live connections (`HERALD_BROKER_MAX_CONNECTIONS`; default 8192; reject + close when full).
+- Optional per-TCP-peer connection cap (`HERALD_BROKER_MAX_CONNS_PER_IP`; default 0 = unlimited). Older builds hard-capped at 32 per peer address; that breaks reverse-proxy deploys where every client shares the proxy's IP. Set `HERALD_BROKER_MAX_CONNS_PER_IP=32` to restore the old in-process limit on direct exposure, or enforce per-client limits at the TLS terminator / proxy instead.
 - Room table cap and peers-per-room cap.
 - Room map tombstones: evicting a colliding room does not hide later probe-chain occupants (leave still unlinks `Conn *`).
 - No disk persistence of room traffic; no room-list endpoint.
@@ -33,6 +34,7 @@ Prefer private email over public issues for unfixed bugs. Coordinated disclosure
 - Terminate TLS at a reverse proxy; do not expose plain `ws://` on the public internet.
 - Prefer binding the process to localhost when a local proxy owns the public port.
 - Keep `nofile` ≥ max connections (e.g. 65535) and leave `HERALD_BROKER_MAX_CONNECTIONS` set so accept floods shed before thread spawn fails.
-- Optionally also rate-limit at the proxy or host firewall (this binary is still **one OS thread per connection**).
+- Rate-limit or cap connections at the reverse proxy when TLS terminates there (recommended for public exposure). The broker's global `HERALD_BROKER_MAX_CONNECTIONS` still sheds accept floods; per-IP is opt-in via `HERALD_BROKER_MAX_CONNS_PER_IP`.
+- This binary is still **one OS thread per connection**.
 - Keep `HERALD_BROKER_VERBOSE=0` in production (stderr can include room ids / display names).
 - Prefer app-level E2EE for private sessions; use long random room ids.
