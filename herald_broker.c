@@ -44,6 +44,29 @@
  *                                   Origin header must match one entry)
  *   HERALD_BROKER_HOST             (optional; if set, Host header must match)
  *   HERALD_BROKER_VERBOSE          (default 0; set 1 for log lines)
+ *   HERALD_BROKER_MAX_QUEUE_BYTES  (default 64 MiB; per-connection outbound
+ *                                   queue cap — a peer that falls this far
+ *                                   behind is disconnected; 0 = unbounded)
+ *   HERALD_BROKER_MAX_QUEUE_MSGS   (default 1024; per-connection outbound
+ *                                   message cap; same policy; 0 = unbounded)
+ *   HERALD_BROKER_MAX_QUEUE_TOTAL  (default 1 GiB; ceiling on bytes queued
+ *                                   across all connections; the peer being
+ *                                   enqueued to is disconnected; 0 = none)
+ *
+ * Outbound path (slow-peer isolation):
+ *   Every server→client message is appended to that connection's bounded
+ *   FIFO and written by a dedicated per-connection writer thread. Fan-out
+ *   therefore never blocks on any peer's socket: one slow receiver (bad
+ *   Wi-Fi, mobile) only grows its own queue while every other peer gets
+ *   the frame immediately. A broadcast is shared across peers by
+ *   refcount (one copy; PMD compression computed at most once per
+ *   message). When a queue exceeds MAX_QUEUE_BYTES / MAX_QUEUE_MSGS /
+ *   MAX_QUEUE_TOTAL, or a single send makes no progress for the 15 s
+ *   socket timeout, the broker closes that connection; herald_room
+ *   reconnects and the CRDT layer resyncs via frontier ack, which is
+ *   cheaper and more correct than silently dropping frames for that peer.
+ *   There is deliberately no back-pressure onto the sender: one peer's
+ *   downlink must never set the room's pace.
  *
  * WebSocket permessage-deflate (RFC 7692):
  *   Negotiated when the client offers Sec-WebSocket-Extensions:
@@ -160,6 +183,17 @@ static int broker_net_init(void) { return 1; }
 #define HERALD_BROKER_RECV_INITIAL (64u * 1024u)
 /* Thread-per-conn: little stack use (heap holds frames). */
 #define HERALD_BROKER_THREAD_STACK (256u * 1024u)
+/* Per-connection outbound queue caps (see header). 64 MiB lets a slow
+ * downlink absorb one fat CRDT baseline (a 10k-token Daggermap campaign is
+ * ~23 MiB) without being cycled; smaller and a cold joiner on 1 Mbit/s
+ * would be kicked → rejoin → re-sent → kicked forever. */
+#define HERALD_BROKER_DEFAULT_MAX_QUEUE_BYTES (64u * 1024u * 1024u)
+#define HERALD_BROKER_DEFAULT_MAX_QUEUE_MSGS 1024
+/* Process-wide ceiling on bytes sitting in all outbound queues. */
+#define HERALD_BROKER_DEFAULT_MAX_QUEUE_TOTAL (1024u * 1024u * 1024u)
+/* On orderly close the writer may keep flushing queued messages (ERROR,
+ * PRESENCE) for this long before the rest is dropped. */
+#define HERALD_BROKER_CLOSE_FLUSH_MS 2000
 /* Skip PMD when the payload is tiny or compression does not shrink it. */
 #define HERALD_BROKER_PMD_MIN_BYTES 64
 #define HERALD_BROKER_PMD_TRAILER_LEN 4
@@ -170,6 +204,14 @@ static int g_verbose = 0;
 static int g_max_conns = HERALD_BROKER_DEFAULT_MAX_CONNS; /* 0 = unlimited */
 static int g_max_conns_per_ip = 0; /* 0 = unlimited */
 static size_t g_max_catchup = HERALD_BROKER_DEFAULT_MAX_CATCHUP; /* 0 = disable */
+static size_t g_max_queue_bytes = HERALD_BROKER_DEFAULT_MAX_QUEUE_BYTES;
+static int g_max_queue_msgs = HERALD_BROKER_DEFAULT_MAX_QUEUE_MSGS;
+static size_t g_max_queue_total = HERALD_BROKER_DEFAULT_MAX_QUEUE_TOTAL;
+/* Sum of out_bytes over all live connections (per-queue accounting, so a
+ * broadcast shared by N queues counts N times — conservative). */
+static size_t g_queue_total = 0;
+static pthread_mutex_t g_queue_total_mu = PTHREAD_MUTEX_INITIALIZER;
+static size_t g_thread_stack = HERALD_BROKER_THREAD_STACK;
 static int g_live_conns = 0;
 static pthread_mutex_t g_conn_mu = PTHREAD_MUTEX_INITIALIZER;
 static char g_origin_allow[512];
@@ -402,13 +444,28 @@ static void wr_u64_be(uint8_t *p, uint64_t v) {
         p[i] = (uint8_t)(v >> ((7 - i) * 8));
 }
 
-/* Send all bytes; return 1 on success, 0 on error/disconnect. */
+static uint64_t broker_now_ms(void) {
+#if defined(_WIN32)
+    return (uint64_t)GetTickCount64();
+#else
+    /* Wall clock is fine: only used for a short close-flush deadline. */
+    struct timeval tv;
+    gettimeofday(&tv, NULL);
+    return (uint64_t)tv.tv_sec * 1000u + (uint64_t)tv.tv_usec / 1000u;
+#endif
+}
+
+/* Send all bytes; return 1 on success, 0 on error/disconnect/timeout.
+ * Sockets are blocking with SO_SNDTIMEO, so EAGAIN here means the peer
+ * did not drain its receive window within HERALD_BROKER_SEND_TIMEOUT_MS;
+ * treat it as a dead/slow peer rather than spinning (the pre-2026-09
+ * loop retried EAGAIN forever, pinning the fan-out on one bad Wi-Fi). */
 static int send_all(BrokerSock fd, const uint8_t *data, size_t len) {
     while (len > 0) {
         int n = broker_send(fd, data, len, BROKER_SEND_FLAGS);
         if (n <= 0) {
             int err = broker_sock_err();
-            if (n < 0 && (err == BROKER_EINTR || err == BROKER_EAGAIN))
+            if (n < 0 && err == BROKER_EINTR)
                 continue;
             return 0;
         }
@@ -1020,10 +1077,28 @@ static void room_evict_if_empty_locked(Room *r) {
 
 /* -- Connection -------------------------------------------------------- */
 
+/* Refcounted outbound message body. One OutBuf backs a broadcast to N
+ * peers; the PMD-compressed form is computed lazily, once, by whichever
+ * writer thread needs it first. */
+typedef struct OutBuf {
+    int refs;
+    size_t len;
+    pthread_mutex_t comp_mu;
+    int comp_state; /* 0 = untried, 1 = comp valid, 2 = skip (not smaller / failed) */
+    uint8_t *comp;
+    size_t comp_len;
+    uint8_t data[1]; /* len bytes follow (over-allocated) */
+} OutBuf;
+
+typedef struct OutMsg {
+    OutBuf *buf;
+    int raw; /* 1 = pre-framed WS bytes (PONG); write verbatim, never compress */
+    struct OutMsg *next;
+} OutMsg;
+
 struct Conn {
     BrokerSock fd;
     pthread_t thread;
-    pthread_mutex_t write_mu;
     char room_id[HERALD_BROKER_MAX_ROOM_ID];
     char name[HERALD_BROKER_MAX_NAME];
     uint64_t peer_id;
@@ -1032,6 +1107,20 @@ struct Conn {
     int closed;
     int pmd; /* 1 = permessage-deflate negotiated for this socket */
     size_t max_frame;
+
+    /* Outbound queue. The writer thread is the only thread that writes to
+     * fd after the handshake; producers only append under out_mu. */
+    pthread_mutex_t out_mu;
+    pthread_cond_t out_cv;
+    OutMsg *out_head;
+    OutMsg *out_tail;
+    size_t out_bytes;
+    int out_count;
+    int out_stop;           /* reader is exiting: drain (until deadline) then quit */
+    int out_abort;          /* drop queue now, quit after in-flight send */
+    uint64_t out_stop_deadline_ms;
+    int writer_started;
+    pthread_t writer;
 };
 
 static void conn_ref(Conn *c) {
@@ -1039,30 +1128,255 @@ static void conn_ref(Conn *c) {
         (void)__sync_add_and_fetch(&c->refs, 1);
 }
 
+static OutBuf *outbuf_new(const uint8_t *bytes, size_t len) {
+    OutBuf *b = (OutBuf *)malloc(sizeof(OutBuf) + len);
+    if (!b)
+        return NULL;
+    b->refs = 1;
+    b->len = len;
+    pthread_mutex_init(&b->comp_mu, NULL);
+    b->comp_state = 0;
+    b->comp = NULL;
+    b->comp_len = 0;
+    if (len > 0)
+        memcpy(b->data, bytes, len);
+    return b;
+}
+
+static void outbuf_ref(OutBuf *b) { (void)__sync_add_and_fetch(&b->refs, 1); }
+
+static void outbuf_unref(OutBuf *b) {
+    if (!b)
+        return;
+    if (__sync_sub_and_fetch(&b->refs, 1) == 0) {
+        pthread_mutex_destroy(&b->comp_mu);
+        free(b->comp);
+        free(b);
+    }
+}
+
+/* Returns the new process-wide total after adding `add` and removing `sub`. */
+static size_t queue_total_adjust(size_t add, size_t sub) {
+    pthread_mutex_lock(&g_queue_total_mu);
+    g_queue_total += add;
+    g_queue_total = (g_queue_total >= sub) ? g_queue_total - sub : 0;
+    size_t now = g_queue_total;
+    pthread_mutex_unlock(&g_queue_total_mu);
+    return now;
+}
+
+/* Caller holds c->out_mu. */
+static void conn_queue_drop_locked(Conn *c) {
+    OutMsg *m = c->out_head;
+    while (m) {
+        OutMsg *next = m->next;
+        outbuf_unref(m->buf);
+        free(m);
+        m = next;
+    }
+    c->out_head = c->out_tail = NULL;
+    if (c->out_bytes)
+        (void)queue_total_adjust(0, c->out_bytes);
+    c->out_bytes = 0;
+    c->out_count = 0;
+}
+
 static void conn_unref(Conn *c) {
     if (!c)
         return;
     if (__sync_sub_and_fetch(&c->refs, 1) == 0) {
-        pthread_mutex_destroy(&c->write_mu);
+        conn_queue_drop_locked(c);
+        pthread_mutex_destroy(&c->out_mu);
+        pthread_cond_destroy(&c->out_cv);
         free(c);
     }
 }
 
-/* Send an application payload; compress with RSV1 when PMD is on and
- * the deflate result is smaller. */
-static int ws_send_binary(Conn *c, const uint8_t *payload, size_t len) {
-    if (!c || c->closed || c->fd == BROKER_INVALID_SOCK)
-        return 0;
-    if (!c->pmd || !payload)
-        return ws_send_binary_raw(c->fd, payload, len, 0);
+/* Slow-peer policy: mark closed, drop what is queued and wake the reader
+ * (shutdown makes its blocking recv fail) so the normal leave path runs.
+ * Safe from any thread; idempotent. */
+static void conn_kick(Conn *c, const char *why) {
+    if (!c)
+        return;
+    if (__sync_lock_test_and_set(&c->closed, 1) == 0)
+        broker_log("kicking peer %lu (fd %d): %s", (unsigned long)c->peer_id, (int)c->fd, why);
+    pthread_mutex_lock(&c->out_mu);
+    c->out_abort = 1;
+    conn_queue_drop_locked(c);
+    pthread_cond_signal(&c->out_cv);
+    /* fd is invalidated under out_mu by the reader before close(), so this
+     * can never hit a recycled descriptor. */
+    if (c->fd != BROKER_INVALID_SOCK) {
+#if defined(_WIN32)
+        shutdown(c->fd, SD_BOTH);
+#else
+        shutdown(c->fd, SHUT_RDWR);
+#endif
+    }
+    pthread_mutex_unlock(&c->out_mu);
+}
 
-    size_t comp_len = 0;
-    uint8_t *comp = ws_pmd_deflate(payload, len, &comp_len);
-    if (!comp)
-        return ws_send_binary_raw(c->fd, payload, len, 0);
-    int ok = ws_send_binary_raw(c->fd, comp, comp_len, 1);
-    free(comp);
+/* Append to the connection's outbound FIFO. Returns 1 if queued, 0 if the
+ * connection is closed/closing or the queue cap was hit (peer kicked). */
+static int conn_enqueue_buf(Conn *c, OutBuf *b, int raw) {
+    if (!c || !b)
+        return 0;
+    OutMsg *m = (OutMsg *)malloc(sizeof(OutMsg));
+    if (!m)
+        return 0;
+    m->buf = b;
+    m->raw = raw;
+    m->next = NULL;
+    outbuf_ref(b);
+    pthread_mutex_lock(&c->out_mu);
+    if (c->closed || c->out_stop || c->out_abort) {
+        pthread_mutex_unlock(&c->out_mu);
+        outbuf_unref(b);
+        free(m);
+        return 0;
+    }
+    size_t total = queue_total_adjust(b->len, 0);
+    int over_conn = (g_max_queue_bytes && c->out_bytes + b->len > g_max_queue_bytes) ||
+                    (g_max_queue_msgs > 0 && c->out_count >= g_max_queue_msgs);
+    /* Global ceiling: charge the peer we are enqueuing to. It is either the
+     * laggard itself or one of several; either way the room's fast peers
+     * keep receiving and this one rejoins to resync. */
+    int over_total = (g_max_queue_total && total > g_max_queue_total);
+    if (over_conn || over_total) {
+        size_t qb = c->out_bytes;
+        int qc = c->out_count;
+        (void)queue_total_adjust(0, b->len);
+        pthread_mutex_unlock(&c->out_mu);
+        outbuf_unref(b);
+        free(m);
+        char why[160];
+        if (over_conn)
+            snprintf(why, sizeof(why), "outbound queue over cap (%zu bytes / %d msgs queued)", qb,
+                     qc);
+        else
+            snprintf(why, sizeof(why),
+                     "process-wide outbound queue over cap (%zu total; this peer %zu bytes)", total,
+                     qb);
+        conn_kick(c, why);
+        return 0;
+    }
+    if (c->out_tail)
+        c->out_tail->next = m;
+    else
+        c->out_head = m;
+    c->out_tail = m;
+    c->out_bytes += b->len;
+    c->out_count++;
+    pthread_cond_signal(&c->out_cv);
+    pthread_mutex_unlock(&c->out_mu);
+    return 1;
+}
+
+/* Queue an application payload (framed as a binary WS message by the writer). */
+static int conn_enqueue(Conn *c, const uint8_t *payload, size_t len) {
+    if (!c || c->closed)
+        return 0;
+    OutBuf *b = outbuf_new(payload, len);
+    if (!b)
+        return 0;
+    int ok = conn_enqueue_buf(c, b, 0);
+    outbuf_unref(b);
     return ok;
+}
+
+/* Writer-thread side: frame + send one application message, compressing
+ * with RSV1 when this peer negotiated PMD and deflate shrinks it. */
+static int ws_send_outbuf(Conn *c, OutBuf *b) {
+    if (!c->pmd)
+        return ws_send_binary_raw(c->fd, b->data, b->len, 0);
+    pthread_mutex_lock(&b->comp_mu);
+    if (b->comp_state == 0) {
+        size_t comp_len = 0;
+        uint8_t *comp = ws_pmd_deflate(b->data, b->len, &comp_len);
+        if (comp) {
+            b->comp = comp;
+            b->comp_len = comp_len;
+            b->comp_state = 1;
+        } else {
+            b->comp_state = 2;
+        }
+    }
+    int use_comp = (b->comp_state == 1);
+    pthread_mutex_unlock(&b->comp_mu);
+    /* comp is immutable once comp_state==1; read without the lock. */
+    if (use_comp)
+        return ws_send_binary_raw(c->fd, b->comp, b->comp_len, 1);
+    return ws_send_binary_raw(c->fd, b->data, b->len, 0);
+}
+
+static void *conn_writer_main(void *arg) {
+    Conn *c = (Conn *)arg;
+    for (;;) {
+        pthread_mutex_lock(&c->out_mu);
+        while (!c->out_head && !c->out_stop && !c->out_abort)
+            pthread_cond_wait(&c->out_cv, &c->out_mu);
+        if (c->out_abort || (c->out_stop && broker_now_ms() >= c->out_stop_deadline_ms)) {
+            conn_queue_drop_locked(c);
+            pthread_mutex_unlock(&c->out_mu);
+            break;
+        }
+        if (!c->out_head) { /* out_stop with empty queue */
+            pthread_mutex_unlock(&c->out_mu);
+            break;
+        }
+        OutMsg *m = c->out_head;
+        c->out_head = m->next;
+        if (!c->out_head)
+            c->out_tail = NULL;
+        c->out_bytes -= m->buf->len;
+        c->out_count--;
+        (void)queue_total_adjust(0, m->buf->len);
+        pthread_mutex_unlock(&c->out_mu);
+
+        int ok = m->raw ? send_all(c->fd, m->buf->data, m->buf->len) : ws_send_outbuf(c, m->buf);
+        outbuf_unref(m->buf);
+        free(m);
+        if (!ok) {
+            conn_kick(c, "send failed or timed out");
+            break;
+        }
+    }
+    conn_unref(c);
+    return NULL;
+}
+
+static int conn_writer_start(Conn *c) {
+    pthread_attr_t attr;
+    int attr_ok = (pthread_attr_init(&attr) == 0);
+    if (attr_ok && pthread_attr_setstacksize(&attr, g_thread_stack) != 0)
+        broker_log("writer stacksize(%zu) failed; using default", g_thread_stack);
+    conn_ref(c); /* writer's reference; released in conn_writer_main */
+    int rc = pthread_create(&c->writer, attr_ok ? &attr : NULL, conn_writer_main, c);
+    if (attr_ok)
+        pthread_attr_destroy(&attr);
+    if (rc != 0) {
+        conn_unref(c);
+        return 0;
+    }
+    c->writer_started = 1;
+    return 1;
+}
+
+/* Reader is exiting. flush=1: let queued messages (ERROR, final PRESENCE)
+ * go out for up to HERALD_BROKER_CLOSE_FLUSH_MS; flush=0: drop them.
+ * Joins the writer so nothing touches fd after we return. */
+static void conn_writer_stop(Conn *c, int flush) {
+    if (!c->writer_started)
+        return;
+    pthread_mutex_lock(&c->out_mu);
+    c->out_stop = 1;
+    if (!flush)
+        c->out_abort = 1;
+    c->out_stop_deadline_ms = broker_now_ms() + HERALD_BROKER_CLOSE_FLUSH_MS;
+    pthread_cond_signal(&c->out_cv);
+    pthread_mutex_unlock(&c->out_mu);
+    pthread_join(c->writer, NULL);
+    c->writer_started = 0;
 }
 
 static int conn_add_peer_locked(Room *r, Conn *c) {
@@ -1102,10 +1416,7 @@ static int conn_send_error(Conn *dst, uint8_t code, const char *msg) {
         memcpy(payload + off, msg, msg_len);
         off += msg_len;
     }
-    pthread_mutex_lock(&dst->write_mu);
-    int ok = ws_send_binary(dst, payload, off);
-    pthread_mutex_unlock(&dst->write_mu);
-    return ok;
+    return conn_enqueue(dst, payload, off);
 }
 
 static int conn_send_presence_locked(Conn *dst, uint8_t kind, uint64_t peer_id, const char *name) {
@@ -1125,19 +1436,13 @@ static int conn_send_presence_locked(Conn *dst, uint8_t kind, uint64_t peer_id, 
         memcpy(payload + off, name, name_len);
         off += name_len;
     }
-    pthread_mutex_lock(&dst->write_mu);
-    int ok = ws_send_binary(dst, payload, off);
-    pthread_mutex_unlock(&dst->write_mu);
-    return ok;
+    return conn_enqueue(dst, payload, off);
 }
 
 static int conn_send_buffered_broadcast(Conn *dst, const uint8_t *bytes, size_t len) {
     if (len == 0)
         return 1;
-    pthread_mutex_lock(&dst->write_mu);
-    int ok = ws_send_binary(dst, bytes, len);
-    pthread_mutex_unlock(&dst->write_mu);
-    return ok;
+    return conn_enqueue(dst, bytes, len);
 }
 
 /* Build a relay frame with the sender peer id prefix after the action
@@ -1208,21 +1513,19 @@ static int conn_send_join_ack(Conn *dst, uint64_t peer_id) {
     uint8_t payload[1 + 8];
     payload[0] = HERALD_ROOM_ACTION_JOIN_ACK;
     wr_u64_le(payload + 1, peer_id);
-    pthread_mutex_lock(&dst->write_mu);
-    int ok = ws_send_binary(dst, payload, sizeof(payload));
-    pthread_mutex_unlock(&dst->write_mu);
-    return ok;
+    return conn_enqueue(dst, payload, sizeof(payload));
 }
 
 static int payload_starts_hcan(const uint8_t *app, size_t app_len) {
     return app && app_len >= 4 && app[0] == 'H' && app[1] == 'C' && app[2] == 'A' && app[3] == 'N';
 }
 
-/* Caller holds g_rooms_mu. Copies the wire bytes, snapshots peers, then
- * drops the lock before send. Always returns with g_rooms_mu unlocked. */
+/* Caller holds g_rooms_mu. Builds one shared OutBuf, snapshots peers, drops
+ * the lock, then appends the buffer to every peer's outbound queue. Never
+ * blocks on a socket: a slow peer only grows its own queue (and is kicked
+ * at the cap). Always returns with g_rooms_mu unlocked. */
 static void fanout_broadcast(Room *r, Conn *src, const uint8_t *frame, size_t frame_len) {
-    uint8_t *wire = NULL;
-    size_t wire_len = 0;
+    OutBuf *wire = NULL;
     Conn *snaps[HERALD_BROKER_MAX_PEERS_PER_ROOM];
     int n = 0;
     if (frame_len >= 1 && frame[0] == HERALD_ROOM_ACTION_BROADCAST) {
@@ -1232,35 +1535,28 @@ static void fanout_broadcast(Room *r, Conn *src, const uint8_t *frame, size_t fr
         uint8_t *relay = broker_build_relay_frame(HERALD_ROOM_ACTION_BROADCAST, src->peer_id, app,
                                                   app_len, &relay_len);
         if (relay) {
+            wire = outbuf_new(relay, relay_len);
             int cache = !payload_starts_hcan(app, app_len) && relay_len <= g_max_catchup;
             if (cache) {
                 if (r->last_broadcast)
                     free(r->last_broadcast);
                 r->last_broadcast = relay;
                 r->last_broadcast_len = relay_len;
-                wire = (uint8_t *)malloc(relay_len);
-                if (wire) {
-                    memcpy(wire, relay, relay_len);
-                    wire_len = relay_len;
-                }
             } else {
-                wire = relay;
-                wire_len = relay_len;
+                free(relay);
             }
-            n = room_snapshot_others_locked(r, src, snaps, HERALD_BROKER_MAX_PEERS_PER_ROOM);
+            if (wire)
+                n = room_snapshot_others_locked(r, src, snaps, HERALD_BROKER_MAX_PEERS_PER_ROOM);
         }
     }
     pthread_mutex_unlock(&g_rooms_mu);
     for (int i = 0; i < n; ++i) {
         Conn *peer = snaps[i];
-        if (wire && !peer->closed) {
-            pthread_mutex_lock(&peer->write_mu);
-            ws_send_binary(peer, wire, wire_len);
-            pthread_mutex_unlock(&peer->write_mu);
-        }
+        if (!peer->closed)
+            (void)conn_enqueue_buf(peer, wire, 0);
     }
     conn_snapshot_release(snaps, n);
-    free(wire);
+    outbuf_unref(wire);
 }
 
 static void send_presence_snapshot(Conn **snaps, int n, uint8_t kind, uint64_t peer_id,
@@ -1292,9 +1588,7 @@ static int conn_route_action(Room *r, Conn *src, uint8_t action, uint64_t dst_id
     pthread_mutex_unlock(&g_rooms_mu);
     int ok = 0;
     if (dst && relay) {
-        pthread_mutex_lock(&dst->write_mu);
-        ok = ws_send_binary(dst, relay, relay_len);
-        pthread_mutex_unlock(&dst->write_mu);
+        ok = conn_enqueue(dst, relay, relay_len);
         conn_unref(dst);
     }
     free(relay);
@@ -1504,6 +1798,7 @@ static int conn_dispatch_frame(Conn *c, const uint8_t *frame, size_t len) {
 
 static void *conn_thread_main(void *arg) {
     Conn *c = (Conn *)arg;
+    int client_close = 0; /* peer sent CLOSE: flush queue, reply CLOSE */
     (void)broker_set_sock_timeouts(c->fd, HERALD_BROKER_HANDSHAKE_TIMEOUT_MS,
                                    HERALD_BROKER_SEND_TIMEOUT_MS);
     int hs = ws_handshake_server(c->fd);
@@ -1517,6 +1812,10 @@ static void *conn_thread_main(void *arg) {
     if (c->pmd)
         broker_log("fd %d negotiated permessage-deflate", (int)c->fd);
     broker_setsockopt_int(c->fd, IPPROTO_TCP, TCP_NODELAY, 1);
+    if (!conn_writer_start(c)) {
+        broker_log("writer thread create failed; closing fd %d", (int)c->fd);
+        goto done;
+    }
 
     size_t cap = HERALD_BROKER_RECV_INITIAL;
     if (cap > c->max_frame)
@@ -1544,29 +1843,20 @@ static void *conn_thread_main(void *arg) {
                 break;
             if (!ws_read_frame_payload(c->fd, h.len, h.masked, payload))
                 break;
-            /* Build a PONG header. FIN + PONG = 0x8A. */
-            uint8_t dyn[14];
-            size_t dh = 0;
-            if (h.len <= 125) {
-                dyn[0] = 0x8A;
-                dyn[1] = (uint8_t)h.len;
-                dh = 2;
-            } else if (h.len <= 0xFFFF) {
-                dyn[0] = 0x8A;
-                dyn[1] = 126;
-                wr_u16_be(dyn + 2, (uint16_t)h.len);
-                dh = 4;
-            } else {
-                dyn[0] = 0x8A;
-                dyn[1] = 127;
-                wr_u64_be(dyn + 2, h.len);
-                dh = 10;
+            /* Build a PONG frame (FIN + PONG = 0x8A; control payload ≤125
+             * per RFC 6455 §5.5, so the 2-byte header always fits) and queue
+             * it pre-framed so it stays ordered with data messages. */
+            uint8_t dyn[2 + 125];
+            size_t plen = h.len <= 125 ? (size_t)h.len : 125u;
+            dyn[0] = 0x8A;
+            dyn[1] = (uint8_t)plen;
+            if (plen > 0)
+                memcpy(dyn + 2, payload, plen);
+            OutBuf *pong = outbuf_new(dyn, 2 + plen);
+            if (pong) {
+                (void)conn_enqueue_buf(c, pong, 1);
+                outbuf_unref(pong);
             }
-            pthread_mutex_lock(&c->write_mu);
-            send_all(c->fd, dyn, dh);
-            if (h.len > 0)
-                send_all(c->fd, payload, (size_t)h.len);
-            pthread_mutex_unlock(&c->write_mu);
             continue;
         }
         /* PONG — curl and other clients may send these (e.g. keepalive
@@ -1585,10 +1875,7 @@ static void *conn_thread_main(void *arg) {
                     break;
                 (void)ws_read_frame_payload(c->fd, h.len, h.masked, payload);
             }
-            uint8_t close_hdr[4] = {0x88, 0x02, 0x03, 0xE8}; /* 1000 normal */
-            pthread_mutex_lock(&c->write_mu);
-            send_all(c->fd, close_hdr, 4);
-            pthread_mutex_unlock(&c->write_mu);
+            client_close = 1;
             break;
         }
         /* App data: reassemble BINARY fragments (FIN=0 … FIN=1). TEXT is rejected. */
@@ -1661,23 +1948,38 @@ static void *conn_thread_main(void *arg) {
 
 free_payload:
     free(payload);
-done:
-    c->closed = 1;
-    {
-        Conn *snaps[HERALD_BROKER_MAX_PEERS_PER_ROOM];
-        uint64_t leave_id = 0;
-        char leave_name[HERALD_BROKER_MAX_NAME];
-        pthread_mutex_lock(&g_rooms_mu);
-        int n = conn_leave_room_locked(c, snaps, HERALD_BROKER_MAX_PEERS_PER_ROOM, &leave_id,
-                                       leave_name, sizeof(leave_name));
-        pthread_mutex_unlock(&g_rooms_mu);
-        send_presence_snapshot(snaps, n, 1, leave_id, leave_name);
+done: {
+    /* If closed was already set, a writer/fan-out kicked us (slow peer or
+     * send failure): nothing queued is worth flushing. Otherwise (client
+     * CLOSE, protocol error after an ERROR frame) let the writer drain for a
+     * bounded time so the last frames reach the peer. */
+    int kicked = (__sync_lock_test_and_set(&c->closed, 1) != 0);
+    Conn *snaps[HERALD_BROKER_MAX_PEERS_PER_ROOM];
+    uint64_t leave_id = 0;
+    char leave_name[HERALD_BROKER_MAX_NAME];
+    pthread_mutex_lock(&g_rooms_mu);
+    int n = conn_leave_room_locked(c, snaps, HERALD_BROKER_MAX_PEERS_PER_ROOM, &leave_id,
+                                   leave_name, sizeof(leave_name));
+    pthread_mutex_unlock(&g_rooms_mu);
+    send_presence_snapshot(snaps, n, 1, leave_id, leave_name);
+
+    conn_writer_stop(c, /*flush=*/!kicked);
+    if (client_close && !kicked) {
+        uint8_t close_hdr[4] = {0x88, 0x02, 0x03, 0xE8}; /* 1000 normal */
+        (void)send_all(c->fd, close_hdr, 4);
     }
-    broker_close(c->fd);
+    /* Invalidate under out_mu so a late conn_kick() from another thread
+     * cannot shutdown() a recycled descriptor. */
+    pthread_mutex_lock(&c->out_mu);
+    BrokerSock fd = c->fd;
+    c->fd = BROKER_INVALID_SOCK;
+    pthread_mutex_unlock(&c->out_mu);
+    broker_close(fd);
     ip_release(c->peer_addr);
     conn_unref(c);
     conn_count_dec();
     return NULL;
+}
 }
 
 /* -- Main -------------------------------------------------------------- */
@@ -1727,6 +2029,32 @@ int main(void) {
             g_max_conns_per_ip = 0;
     }
 
+    const char *mq_env = getenv("HERALD_BROKER_MAX_QUEUE_BYTES");
+    if (mq_env && mq_env[0]) {
+        /* Explicit 0 = unbounded bytes (message cap still applies). */
+        g_max_queue_bytes = (size_t)strtoul(mq_env, NULL, 10);
+    }
+    /* A queue that cannot hold one max frame would kick every peer on the
+     * first large broadcast. */
+    if (g_max_queue_bytes && g_max_queue_bytes < max_frame + 64)
+        g_max_queue_bytes = max_frame + 64;
+
+    const char *mqm_env = getenv("HERALD_BROKER_MAX_QUEUE_MSGS");
+    if (mqm_env && mqm_env[0]) {
+        /* Explicit 0 = unbounded count (byte cap still applies). */
+        g_max_queue_msgs = (int)strtol(mqm_env, NULL, 10);
+        if (g_max_queue_msgs < 0)
+            g_max_queue_msgs = HERALD_BROKER_DEFAULT_MAX_QUEUE_MSGS;
+    }
+
+    const char *mqt_env = getenv("HERALD_BROKER_MAX_QUEUE_TOTAL");
+    if (mqt_env && mqt_env[0]) {
+        /* Explicit 0 = no process-wide ceiling. */
+        g_max_queue_total = (size_t)strtoul(mqt_env, NULL, 10);
+    }
+    if (g_max_queue_total && g_max_queue_bytes && g_max_queue_total < g_max_queue_bytes)
+        g_max_queue_total = g_max_queue_bytes;
+
     const char *vb = getenv("HERALD_BROKER_VERBOSE");
     g_verbose = (vb && vb[0] != '0') ? 1 : 0;
 
@@ -1760,6 +2088,7 @@ int main(void) {
     if (stack_sz < (size_t)PTHREAD_STACK_MIN)
         stack_sz = (size_t)PTHREAD_STACK_MIN;
 #endif
+    g_thread_stack = stack_sz;
 
     BrokerSock srv = socket(AF_INET, SOCK_STREAM, 0);
     if (srv == BROKER_INVALID_SOCK) {
@@ -1783,9 +2112,10 @@ int main(void) {
     }
     fprintf(stderr,
             "[broker] listening on %s:%d (max_frame=%zu max_catchup=%zu max_conns=%d "
-            "max_conns_per_ip=%d stack=%zu)\n",
+            "max_conns_per_ip=%d max_queue_bytes=%zu max_queue_msgs=%d max_queue_total=%zu "
+            "stack=%zu)\n",
             bind_label, port, max_frame, g_max_catchup, g_max_conns, g_max_conns_per_ip,
-            stack_sz);
+            g_max_queue_bytes, g_max_queue_msgs, g_max_queue_total, stack_sz);
 
     for (;;) {
         struct sockaddr_in caddr;
@@ -1820,7 +2150,8 @@ int main(void) {
         c->max_frame = max_frame;
         c->peer_addr = ip;
         c->refs = 1;
-        pthread_mutex_init(&c->write_mu, NULL);
+        pthread_mutex_init(&c->out_mu, NULL);
+        pthread_cond_init(&c->out_cv, NULL);
 
         pthread_attr_t attr;
         int attr_ok = (pthread_attr_init(&attr) == 0);
