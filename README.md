@@ -10,7 +10,7 @@ A small WebSocket **room relay**: accept clients, put them in rooms, fan out opa
 - Rooms keyed by opaque `room_id` (capability join — knowing the id is enough to enter).
 - Fan-out: `BROADCAST`, `DIRECT`, `PRESENCE`, join/leave. Application bytes stay opaque.
 - **Non-blocking fan-out:** each connection has a dedicated writer thread and a bounded outbound FIFO. Producers (including room broadcast) only enqueue; they never block on another peer's socket. Broadcasts share one refcounted payload (PMD compressed at most once per message).
-- **Slow-peer isolation:** if a peer's outbound queue exceeds the byte/message caps, or a single send hits the 15 s socket send timeout, that connection is kicked. Clients reconnect; app-layer CRDT resyncs via frontier ack (cheaper than silently dropping frames).
+- **Slow-peer isolation:** if a peer's outbound queue exceeds the byte/message caps, outbound enqueue allocation fails, or a single send hits the 15 s socket send timeout, that connection is kicked. Clients reconnect; app-layer CRDT resyncs via frontier ack (cheaper than silently dropping frames).
 - In-memory only. Caps: rooms, peers/room, max frame size, outbound queue (env).
 
 ## What it does not do
@@ -51,7 +51,7 @@ docker run --rm -p 8787:8787 --ulimit nofile=65535:65535 \
 | `HERALD_BROKER_MAX_CONNS_PER_IP` | `0` (unlimited) | Max live sockets per TCP peer address; set `32` to restore the former hard cap |
 | `HERALD_BROKER_MAX_QUEUE_BYTES` | `67108864` (64 MiB) | Per-connection outbound queue byte cap; `0` = unbounded bytes (message cap still applies). Floored to at least one max frame. |
 | `HERALD_BROKER_MAX_QUEUE_MSGS` | `1024` | Per-connection outbound queue message cap; `0` = unbounded count (byte cap still applies) |
-| `HERALD_BROKER_MAX_QUEUE_TOTAL` | `1073741824` (1 GiB) | Ceiling on bytes queued across **all** connections; when exceeded, the peer being enqueued to is kicked. `0` = no ceiling. Floored to `MAX_QUEUE_BYTES`. |
+| `HERALD_BROKER_MAX_QUEUE_TOTAL` | `1073741824` (1 GiB) | Ceiling on bytes queued across **all** connections; when exceeded, the **heaviest** outbound queue is kicked (not necessarily the enqueue target). `0` = no ceiling. Floored to `MAX_QUEUE_BYTES`. |
 | `HERALD_BROKER_ORIGIN` | unset | If set, a present `Origin` header must match (comma-list) |
 | `HERALD_BROKER_HOST` | unset | If set, `Host` header must match |
 | `HERALD_BROKER_VERBOSE` | `0` | `1` = stderr metadata logs (includes kick reasons) |
@@ -60,7 +60,7 @@ Raise the process `nofile` limit to at least `MAX_CONNECTIONS` (container image 
 
 **Reverse-proxy / TLS terminator:** the broker sees every client as the proxy's source IP. The default per-IP cap is unlimited (`HERALD_BROKER_MAX_CONNS_PER_IP=0`); global `HERALD_BROKER_MAX_CONNECTIONS` still applies. To re-enable a strict per-IP limit in-process, set `HERALD_BROKER_MAX_CONNS_PER_IP=32` (or another value) — or rate-limit at the proxy.
 
-**Queue sizing:** there is no back-pressure onto the sender — one peer's downlink never sets the room's pace — so a slow peer's queue must be able to hold whatever the app bursts at it. The 64 MiB default fits one fat CRDT baseline (a 10k-token Daggermap campaign is ~23 MiB) plus follow-up deltas, so a cold joiner on a ~1 Mbit/s link drains it over a few minutes instead of being kicked → rejoined → re-sent → kicked. Lower it on tiny hosts (`MAX_QUEUE_TOTAL` bounds the worst case regardless); raise it if fat-doc sessions kick healthy-but-briefly-buffered peers. Over-cap always disconnects that peer (never drops individual frames while leaving the socket up). Regression/load tests in the parent `C` repo:
+**Queue sizing:** there is no back-pressure onto the sender — one peer's downlink never sets the room's pace — so a slow peer's queue must be able to hold whatever the app bursts at it. The 64 MiB default fits one fat CRDT baseline (a 10k-token Daggermap campaign is ~23 MiB) plus follow-up deltas, so a cold joiner on a ~1 Mbit/s link drains it over a few minutes instead of being kicked → rejoined → re-sent → kicked. Lower it on tiny hosts (`MAX_QUEUE_TOTAL` bounds the worst case regardless); raise it if fat-doc sessions kick healthy-but-briefly-buffered peers. Per-connection over-cap disconnects that peer; process-wide over-cap disconnects the heaviest queue (never drops individual frames while leaving a socket up). Regression/load tests in the parent `C` repo:
 - `python3 tools/herald_broker_slowpeer_test.py` — non-reading peer is kicked; fast peers stay at sender pace.
 - `python3 tools/herald_broker_slowdrain_test.py` — slow-but-draining peer eventually gets every frame; **no kick**; fast peers unblocked.
 
