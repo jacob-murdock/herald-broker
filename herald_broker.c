@@ -50,8 +50,10 @@
  *   HERALD_BROKER_MAX_QUEUE_MSGS   (default 1024; per-connection outbound
  *                                   message cap; same policy; 0 = unbounded)
  *   HERALD_BROKER_MAX_QUEUE_TOTAL  (default 1 GiB; ceiling on bytes queued
- *                                   across all connections; the peer being
- *                                   enqueued to is disconnected; 0 = none)
+ *                                   across all connections; the heaviest
+ *                                   outbound queue is disconnected — not
+ *                                   necessarily the peer being enqueued to;
+ *                                   0 = none)
  *
  * Outbound path (slow-peer isolation):
  *   Every server→client message is appended to that connection's bounded
@@ -61,10 +63,11 @@
  *   the frame immediately. A broadcast is shared across peers by
  *   refcount (one copy; PMD compression computed at most once per
  *   message). When a queue exceeds MAX_QUEUE_BYTES / MAX_QUEUE_MSGS /
- *   MAX_QUEUE_TOTAL, or a single send makes no progress for the 15 s
- *   socket timeout, the broker closes that connection; herald_room
- *   reconnects and the CRDT layer resyncs via frontier ack, which is
- *   cheaper and more correct than silently dropping frames for that peer.
+ *   MAX_QUEUE_TOTAL, outbound enqueue allocation fails, or a single send
+ *   makes no progress for the 15 s socket timeout, the broker closes that
+ *   connection; herald_room reconnects and the CRDT layer resyncs via
+ *   frontier ack, which is cheaper and more correct than silently dropping
+ *   frames for that peer.
  *   There is deliberately no back-pressure onto the sender: one peer's
  *   downlink must never set the room's pace.
  *
@@ -614,6 +617,8 @@ static uint8_t *ws_pmd_inflate(const uint8_t *comp, size_t comp_len, size_t max_
 
 /* -- WebSocket recv (client -> server, masked) ------------------------- */
 
+typedef struct Conn Conn;
+
 typedef struct {
     int fin;
     int rsv1;
@@ -621,71 +626,6 @@ typedef struct {
     int masked;
     uint64_t len;
 } WsFrameHdr;
-
-static int ws_read_exact(BrokerSock fd, uint8_t *buf, size_t len) {
-    size_t got = 0;
-    while (got < len) {
-        int n = broker_recv(fd, buf + got, len - got, 0);
-        if (n <= 0) {
-            if (n < 0 && broker_sock_err() == BROKER_EINTR)
-                continue;
-            return 0;
-        }
-        got += (size_t)n;
-    }
-    return 1;
-}
-
-static int ws_read_frame_header(BrokerSock fd, WsFrameHdr *out, size_t max_payload) {
-    uint8_t b[2];
-    if (!ws_read_exact(fd, b, 2))
-        return 0;
-    out->fin = (b[0] & 0x80) != 0;
-    out->rsv1 = (b[0] & 0x40) != 0;
-    /* RSV2/RSV3 must be 0 without other extensions. */
-    if (b[0] & 0x30)
-        return 0;
-    out->opcode = b[0] & 0x0F;
-    out->masked = (b[1] & 0x80) != 0;
-    uint64_t len7 = b[1] & 0x7F;
-    if (len7 == 126) {
-        uint8_t ext[2];
-        if (!ws_read_exact(fd, ext, 2))
-            return 0;
-        out->len = rd_u16_be(ext);
-    } else if (len7 == 127) {
-        uint8_t ext[8];
-        if (!ws_read_exact(fd, ext, 8))
-            return 0;
-        out->len = rd_u64_be(ext);
-    } else {
-        out->len = len7;
-    }
-    if (out->len > max_payload)
-        return 0;
-    /* RFC 6455 §5.5: control frames MUST be ≤125 bytes and MUST NOT be fragmented. */
-    if ((out->opcode == 0x08 || out->opcode == 0x09 || out->opcode == 0x0A) &&
-        (!out->fin || out->len > 125))
-        return 0;
-    return 1;
-}
-
-static int ws_read_frame_payload(BrokerSock fd, uint64_t len, int masked, uint8_t *out_buf) {
-    uint8_t mask[4] = {0};
-    if (masked) {
-        if (!ws_read_exact(fd, mask, 4))
-            return 0;
-    }
-    if (len == 0)
-        return 1;
-    if (!ws_read_exact(fd, out_buf, (size_t)len))
-        return 0;
-    if (masked) {
-        for (uint64_t i = 0; i < len; ++i)
-            out_buf[i] ^= mask[i & 3];
-    }
-    return 1;
-}
 
 /* -- WebSocket handshake (RFC 6455 Sec-WebSocket-Accept) -------------- */
 
@@ -867,110 +807,7 @@ static int ws_extensions_offers_pmd(const char *ext) {
     return 0;
 }
 
-/* Handshake result: 0 = fail, 1 = ok without PMD, 2 = ok with PMD. */
-static int ws_handshake_server(BrokerSock fd) {
-    char buf[2048];
-    size_t total = 0;
-    /* Read until \r\n\r\n (header terminator). Cap at 2 KiB. */
-    while (total < sizeof(buf) - 1) {
-        int n = broker_recv(fd, buf + total, sizeof(buf) - 1 - total, 0);
-        if (n <= 0)
-            return 0;
-        total += (size_t)n;
-        buf[total] = '\0';
-        if (strstr(buf, "\r\n\r\n"))
-            break;
-    }
-    /* Token-by-token header walk. We require Upgrade: websocket and a
-     * Sec-WebSocket-Key, then answer with a spec-compliant Accept. */
-    int has_upgrade = 0, has_key = 0, has_version13 = 0, has_connection = 0, want_pmd = 0;
-    char key[64] = {0};
-    char origin[256] = {0};
-    char host[256] = {0};
-    char *p = buf;
-    /* Skip the request line. Require GET. */
-    char *eol = strstr(p, "\r\n");
-    if (!eol)
-        return 0;
-    *eol = '\0';
-    if (strncasecmp(p, "GET ", 4) != 0)
-        return 0;
-    p = eol + 2;
-    while (p && *p && !(p[0] == '\r' && p[1] == '\n')) {
-        char *next = strstr(p, "\r\n");
-        if (!next)
-            break;
-        *next = '\0';
-        char *colon = strchr(p, ':');
-        if (colon) {
-            *colon = '\0';
-            char *v = colon + 1;
-            while (*v == ' ' || *v == '\t')
-                ++v;
-            if (strcasecmp(p, "Upgrade") == 0 && broker_strcasestr(v, "websocket"))
-                has_upgrade = 1;
-            else if (strcasecmp(p, "Connection") == 0 && broker_strcasestr(v, "Upgrade"))
-                has_connection = 1;
-            else if (strcasecmp(p, "Sec-WebSocket-Key") == 0) {
-                broker_copy_cstr(key, sizeof(key), v);
-                has_key = 1;
-            } else if (strcasecmp(p, "Sec-WebSocket-Version") == 0) {
-                if (atoi(v) == 13)
-                    has_version13 = 1;
-            } else if (strcasecmp(p, "Sec-WebSocket-Extensions") == 0) {
-                if (ws_extensions_offers_pmd(v))
-                    want_pmd = 1;
-            } else if (strcasecmp(p, "Origin") == 0) {
-                broker_copy_cstr(origin, sizeof(origin), v);
-            } else if (strcasecmp(p, "Host") == 0) {
-                broker_copy_cstr(host, sizeof(host), v);
-            }
-        }
-        p = next + 2;
-    }
-    if (!has_upgrade || !has_key || !has_version13 || !has_connection)
-        return 0;
-    if (g_origin_allow[0] && origin[0] && !header_list_contains(g_origin_allow, origin))
-        return 0;
-    if (g_host_allow[0] && (!host[0] || !header_list_contains(g_host_allow, host)))
-        return 0;
-    trim_ws_key(key);
-    char accept[64];
-    if (!ws_compute_accept(key, accept, sizeof(accept)))
-        return 0;
-    char resp[512];
-    int n;
-    if (want_pmd) {
-        /* Force no_context_takeover both ways — one-shot zlib, no
-         * per-connection inflate/deflate dictionary to retain. */
-        n = snprintf(resp, sizeof(resp),
-                     "HTTP/1.1 101 Switching Protocols\r\n"
-                     "Upgrade: websocket\r\n"
-                     "Connection: Upgrade\r\n"
-                     "Sec-WebSocket-Accept: %s\r\n"
-                     "Sec-WebSocket-Extensions: permessage-deflate; "
-                     "client_no_context_takeover; server_no_context_takeover\r\n"
-                     "\r\n",
-                     accept);
-    } else {
-        n = snprintf(resp, sizeof(resp),
-                     "HTTP/1.1 101 Switching Protocols\r\n"
-                     "Upgrade: websocket\r\n"
-                     "Connection: Upgrade\r\n"
-                     "Sec-WebSocket-Accept: %s\r\n"
-                     "\r\n",
-                     accept);
-    }
-    if (n <= 0 || (size_t)n >= sizeof(resp))
-        return 0;
-    if (!send_all(fd, (const uint8_t *)resp, (size_t)n))
-        return 0;
-    return want_pmd ? 2 : 1;
-}
-
 /* -- Rooms map --------------------------------------------------------- */
-
-typedef struct Conn Conn;
 
 /* Open-addressed, linear probe. EMPTY stops a probe; TOMB does not.
  * Evicting into EMPTY punches a hole: leave/disconnect never unlinks
@@ -1121,11 +958,271 @@ struct Conn {
     uint64_t out_stop_deadline_ms;
     int writer_started;
     pthread_t writer;
+
+    /* Link in g_all_conns (process-wide queue accounting / heaviest kick). */
+    struct Conn *all_next;
+
+    /* Leftover bytes from the HTTP handshake recv (pipelined WS frames). */
+    uint8_t *carry;
+    size_t carry_len;
+    size_t carry_off;
 };
+
+static int ws_read_exact_c(Conn *c, uint8_t *buf, size_t len) {
+    size_t got = 0;
+    while (got < len) {
+        if (c->carry_off < c->carry_len) {
+            size_t avail = c->carry_len - c->carry_off;
+            size_t take = len - got;
+            if (take > avail)
+                take = avail;
+            memcpy(buf + got, c->carry + c->carry_off, take);
+            c->carry_off += take;
+            got += take;
+            continue;
+        }
+        int n = broker_recv(c->fd, buf + got, len - got, 0);
+        if (n <= 0) {
+            if (n < 0 && broker_sock_err() == BROKER_EINTR)
+                continue;
+            return 0;
+        }
+        got += (size_t)n;
+    }
+    return 1;
+}
+
+static int ws_read_frame_header(Conn *c, WsFrameHdr *out, size_t max_payload) {
+    uint8_t b[2];
+    if (!ws_read_exact_c(c, b, 2))
+        return 0;
+    out->fin = (b[0] & 0x80) != 0;
+    out->rsv1 = (b[0] & 0x40) != 0;
+    /* RSV2/RSV3 must be 0 without other extensions. */
+    if (b[0] & 0x30)
+        return 0;
+    out->opcode = b[0] & 0x0F;
+    out->masked = (b[1] & 0x80) != 0;
+    uint64_t len7 = b[1] & 0x7F;
+    if (len7 == 126) {
+        uint8_t ext[2];
+        if (!ws_read_exact_c(c, ext, 2))
+            return 0;
+        out->len = rd_u16_be(ext);
+        if (out->len < 126)
+            return 0;
+    } else if (len7 == 127) {
+        uint8_t ext[8];
+        if (!ws_read_exact_c(c, ext, 8))
+            return 0;
+        /* RFC 6455 §5.2: MSB must be 0; 0–125 must use the 7-bit length field. */
+        if (ext[0] || ext[1] || ext[2] || ext[3])
+            return 0;
+        out->len = rd_u64_be(ext);
+        if (out->len < 126)
+            return 0;
+    } else {
+        out->len = len7;
+    }
+    if (out->len > max_payload)
+        return 0;
+    /* RFC 6455 §5.5: control frames MUST be ≤125 bytes and MUST NOT be fragmented. */
+    if ((out->opcode == 0x08 || out->opcode == 0x09 || out->opcode == 0x0A) &&
+        (!out->fin || out->len > 125))
+        return 0;
+    return 1;
+}
+
+static int ws_read_frame_payload(Conn *c, uint64_t len, int masked, uint8_t *out_buf) {
+    uint8_t mask[4] = {0};
+    if (masked) {
+        if (!ws_read_exact_c(c, mask, 4))
+            return 0;
+    }
+    if (len == 0)
+        return 1;
+    if (!ws_read_exact_c(c, out_buf, (size_t)len))
+        return 0;
+    if (masked) {
+        for (uint64_t i = 0; i < len; ++i)
+            out_buf[i] ^= mask[i & 3];
+    }
+    return 1;
+}
+
+/* Handshake result: 0 = fail, 1 = ok without PMD, 2 = ok with PMD.
+ * Bytes after the HTTP header in the first recv are stashed on `c->carry`
+ * so a pipelined WS frame is not dropped. */
+static int ws_handshake_server(Conn *c) {
+    char buf[2048];
+    size_t total = 0;
+    /* Read until \r\n\r\n (header terminator). Cap at 2 KiB. */
+    while (total < sizeof(buf) - 1) {
+        int n = broker_recv(c->fd, buf + total, sizeof(buf) - 1 - total, 0);
+        if (n <= 0)
+            return 0;
+        total += (size_t)n;
+        buf[total] = '\0';
+        if (strstr(buf, "\r\n\r\n"))
+            break;
+    }
+    char *hend = strstr(buf, "\r\n\r\n");
+    if (!hend)
+        return 0;
+    size_t header_len = (size_t)(hend - buf) + 4;
+    if (total > header_len) {
+        size_t extra = total - header_len;
+        c->carry = (uint8_t *)malloc(extra);
+        if (!c->carry)
+            return 0;
+        memcpy(c->carry, buf + header_len, extra);
+        c->carry_len = extra;
+        c->carry_off = 0;
+    }
+    /* Token-by-token header walk. We require Upgrade: websocket and a
+     * Sec-WebSocket-Key, then answer with a spec-compliant Accept. */
+    int has_upgrade = 0, has_key = 0, has_version13 = 0, has_connection = 0, want_pmd = 0;
+    char key[64] = {0};
+    char origin[256] = {0};
+    char host[256] = {0};
+    char *p = buf;
+    /* Skip the request line. Require GET. */
+    char *eol = strstr(p, "\r\n");
+    if (!eol)
+        return 0;
+    *eol = '\0';
+    if (strncasecmp(p, "GET ", 4) != 0)
+        return 0;
+    p = eol + 2;
+    while (p && *p && !(p[0] == '\r' && p[1] == '\n')) {
+        char *next = strstr(p, "\r\n");
+        if (!next)
+            break;
+        *next = '\0';
+        char *colon = strchr(p, ':');
+        if (colon) {
+            *colon = '\0';
+            char *v = colon + 1;
+            while (*v == ' ' || *v == '\t')
+                ++v;
+            if (strcasecmp(p, "Upgrade") == 0 && broker_strcasestr(v, "websocket"))
+                has_upgrade = 1;
+            else if (strcasecmp(p, "Connection") == 0 && broker_strcasestr(v, "Upgrade"))
+                has_connection = 1;
+            else if (strcasecmp(p, "Sec-WebSocket-Key") == 0) {
+                broker_copy_cstr(key, sizeof(key), v);
+                has_key = 1;
+            } else if (strcasecmp(p, "Sec-WebSocket-Version") == 0) {
+                if (atoi(v) == 13)
+                    has_version13 = 1;
+            } else if (strcasecmp(p, "Sec-WebSocket-Extensions") == 0) {
+                if (ws_extensions_offers_pmd(v))
+                    want_pmd = 1;
+            } else if (strcasecmp(p, "Origin") == 0) {
+                broker_copy_cstr(origin, sizeof(origin), v);
+            } else if (strcasecmp(p, "Host") == 0) {
+                broker_copy_cstr(host, sizeof(host), v);
+            }
+        }
+        p = next + 2;
+    }
+    if (!has_upgrade || !has_key || !has_version13 || !has_connection)
+        return 0;
+    if (g_origin_allow[0] && origin[0] && !header_list_contains(g_origin_allow, origin))
+        return 0;
+    if (g_host_allow[0] && (!host[0] || !header_list_contains(g_host_allow, host)))
+        return 0;
+    trim_ws_key(key);
+    /* RFC 6455 §4.1: key is 16 random bytes, base64 → 24 chars. */
+    if (strlen(key) != 24)
+        return 0;
+    char accept[64];
+    if (!ws_compute_accept(key, accept, sizeof(accept)))
+        return 0;
+    char resp[512];
+    int n;
+    if (want_pmd) {
+        /* Force no_context_takeover both ways — one-shot zlib, no
+         * per-connection inflate/deflate dictionary to retain. */
+        n = snprintf(resp, sizeof(resp),
+                     "HTTP/1.1 101 Switching Protocols\r\n"
+                     "Upgrade: websocket\r\n"
+                     "Connection: Upgrade\r\n"
+                     "Sec-WebSocket-Accept: %s\r\n"
+                     "Sec-WebSocket-Extensions: permessage-deflate; "
+                     "client_no_context_takeover; server_no_context_takeover\r\n"
+                     "\r\n",
+                     accept);
+    } else {
+        n = snprintf(resp, sizeof(resp),
+                     "HTTP/1.1 101 Switching Protocols\r\n"
+                     "Upgrade: websocket\r\n"
+                     "Connection: Upgrade\r\n"
+                     "Sec-WebSocket-Accept: %s\r\n"
+                     "\r\n",
+                     accept);
+    }
+    if (n <= 0 || (size_t)n >= sizeof(resp))
+        return 0;
+    if (!send_all(c->fd, (const uint8_t *)resp, (size_t)n))
+        return 0;
+    return want_pmd ? 2 : 1;
+}
 
 static void conn_ref(Conn *c) {
     if (c)
         (void)__sync_add_and_fetch(&c->refs, 1);
+}
+
+static Conn *g_all_conns = NULL;
+static pthread_mutex_t g_all_conns_mu = PTHREAD_MUTEX_INITIALIZER;
+
+static void conn_all_register(Conn *c) {
+    if (!c)
+        return;
+    pthread_mutex_lock(&g_all_conns_mu);
+    c->all_next = g_all_conns;
+    g_all_conns = c;
+    pthread_mutex_unlock(&g_all_conns_mu);
+}
+
+static void conn_all_unregister(Conn *c) {
+    if (!c)
+        return;
+    pthread_mutex_lock(&g_all_conns_mu);
+    Conn **pp = &g_all_conns;
+    while (*pp) {
+        if (*pp == c) {
+            *pp = c->all_next;
+            break;
+        }
+        pp = &(*pp)->all_next;
+    }
+    c->all_next = NULL;
+    pthread_mutex_unlock(&g_all_conns_mu);
+}
+
+/* Heaviest live outbound queue. Ties prefer `hint` so an enqueue target that
+ * is among the fattest still gets charged. Caller must conn_unref the result
+ * if non-NULL (we conn_ref under the list lock). out_bytes is read without
+ * out_mu — approximate by design for victim choice. */
+static Conn *queue_heaviest_conn(Conn *hint) {
+    Conn *best = NULL;
+    size_t best_bytes = 0;
+    pthread_mutex_lock(&g_all_conns_mu);
+    for (Conn *p = g_all_conns; p; p = p->all_next) {
+        if (p->closed)
+            continue;
+        size_t bytes = p->out_bytes;
+        if (!best || bytes > best_bytes || (bytes == best_bytes && hint && p == hint)) {
+            best = p;
+            best_bytes = bytes;
+        }
+    }
+    if (best)
+        conn_ref(best);
+    pthread_mutex_unlock(&g_all_conns_mu);
+    return best;
 }
 
 static OutBuf *outbuf_new(const uint8_t *bytes, size_t len) {
@@ -1185,6 +1282,7 @@ static void conn_unref(Conn *c) {
     if (!c)
         return;
     if (__sync_sub_and_fetch(&c->refs, 1) == 0) {
+        conn_all_unregister(c);
         conn_queue_drop_locked(c);
         pthread_mutex_destroy(&c->out_mu);
         pthread_cond_destroy(&c->out_cv);
@@ -1217,13 +1315,20 @@ static void conn_kick(Conn *c, const char *why) {
 }
 
 /* Append to the connection's outbound FIFO. Returns 1 if queued, 0 if the
- * connection is closed/closing or the queue cap was hit (peer kicked). */
-static int conn_enqueue_buf(Conn *c, OutBuf *b, int raw) {
+ * connection is closed/closing, the queue cap was hit, or allocation failed
+ * (peer kicked in the last two cases — never a silent per-frame drop).
+ * `retry_total`: when the process-wide ceiling trips, kick the heaviest
+ * queue (not always `c`) and retry enqueue once if we freed another peer. */
+static int conn_enqueue_buf_ex(Conn *c, OutBuf *b, int raw, int retry_total) {
     if (!c || !b)
         return 0;
     OutMsg *m = (OutMsg *)malloc(sizeof(OutMsg));
-    if (!m)
+    if (!m) {
+        /* Docs / SECURITY: over-cap disconnects; OOM must match — a live
+         * socket with a missing frame desyncs the CRDT worse than a kick. */
+        conn_kick(c, "outbound enqueue OOM");
         return 0;
+    }
     m->buf = b;
     m->raw = raw;
     m->next = NULL;
@@ -1238,9 +1343,6 @@ static int conn_enqueue_buf(Conn *c, OutBuf *b, int raw) {
     size_t total = queue_total_adjust(b->len, 0);
     int over_conn = (g_max_queue_bytes && c->out_bytes + b->len > g_max_queue_bytes) ||
                     (g_max_queue_msgs > 0 && c->out_count >= g_max_queue_msgs);
-    /* Global ceiling: charge the peer we are enqueuing to. It is either the
-     * laggard itself or one of several; either way the room's fast peers
-     * keep receiving and this one rejoins to resync. */
     int over_total = (g_max_queue_total && total > g_max_queue_total);
     if (over_conn || over_total) {
         size_t qb = c->out_bytes;
@@ -1249,15 +1351,36 @@ static int conn_enqueue_buf(Conn *c, OutBuf *b, int raw) {
         pthread_mutex_unlock(&c->out_mu);
         outbuf_unref(b);
         free(m);
-        char why[160];
-        if (over_conn)
+        char why[192];
+        if (over_conn) {
             snprintf(why, sizeof(why), "outbound queue over cap (%zu bytes / %d msgs queued)", qb,
                      qc);
-        else
+            conn_kick(c, why);
+            return 0;
+        }
+        /* Process-wide ceiling: disconnect the fattest backlog, not whoever
+         * happened to be the next enqueue target (fast peers must not die for
+         * a laggard's queue). */
+        Conn *victim = queue_heaviest_conn(c);
+        int victim_held = (victim != NULL);
+        if (!victim)
+            victim = c;
+        size_t vb = victim->out_bytes;
+        if (victim == c) {
             snprintf(why, sizeof(why),
                      "process-wide outbound queue over cap (%zu total; this peer %zu bytes)", total,
                      qb);
-        conn_kick(c, why);
+        } else {
+            snprintf(why, sizeof(why),
+                     "process-wide outbound queue over cap (%zu total; kicking heaviest peer %lu "
+                     "at %zu bytes; enqueue target had %zu)",
+                     total, (unsigned long)victim->peer_id, vb, qb);
+        }
+        conn_kick(victim, why);
+        if (victim_held)
+            conn_unref(victim);
+        if (retry_total && victim != c && !c->closed)
+            return conn_enqueue_buf_ex(c, b, raw, 0);
         return 0;
     }
     if (c->out_tail)
@@ -1272,13 +1395,19 @@ static int conn_enqueue_buf(Conn *c, OutBuf *b, int raw) {
     return 1;
 }
 
+static int conn_enqueue_buf(Conn *c, OutBuf *b, int raw) {
+    return conn_enqueue_buf_ex(c, b, raw, 1);
+}
+
 /* Queue an application payload (framed as a binary WS message by the writer). */
 static int conn_enqueue(Conn *c, const uint8_t *payload, size_t len) {
     if (!c || c->closed)
         return 0;
     OutBuf *b = outbuf_new(payload, len);
-    if (!b)
+    if (!b) {
+        conn_kick(c, "outbound enqueue OOM");
         return 0;
+    }
     int ok = conn_enqueue_buf(c, b, 0);
     outbuf_unref(b);
     return ok;
@@ -1653,11 +1782,13 @@ static int conn_dispatch_frame(Conn *c, const uint8_t *frame, size_t len) {
         pl -= 2;
         if (name_len > pl)
             return 0;
+        if (name_len >= HERALD_BROKER_MAX_NAME)
+            return 0;
+        if (name_len > 0 && memchr(p, 0, name_len))
+            return 0;
         char name[HERALD_BROKER_MAX_NAME] = {0};
-        if (name_len > 0) {
-            size_t copy = name_len < sizeof(name) - 1 ? name_len : sizeof(name) - 1;
-            memcpy(name, p, copy);
-        }
+        if (name_len > 0)
+            memcpy(name, p, name_len);
         p += name_len;
         pl -= name_len;
         if (pl < 8)
@@ -1801,7 +1932,7 @@ static void *conn_thread_main(void *arg) {
     int client_close = 0; /* peer sent CLOSE: flush queue, reply CLOSE */
     (void)broker_set_sock_timeouts(c->fd, HERALD_BROKER_HANDSHAKE_TIMEOUT_MS,
                                    HERALD_BROKER_SEND_TIMEOUT_MS);
-    int hs = ws_handshake_server(c->fd);
+    int hs = ws_handshake_server(c);
     if (!hs) {
         broker_log("handshake failed; closing fd %d", (int)c->fd);
         goto done;
@@ -1826,7 +1957,7 @@ static void *conn_thread_main(void *arg) {
 
     for (;;) {
         WsFrameHdr h;
-        if (!ws_read_frame_header(c->fd, &h, c->max_frame))
+        if (!ws_read_frame_header(c, &h, c->max_frame))
             break;
         if (!h.masked) {
             broker_log("unmasked client frame; closing");
@@ -1841,7 +1972,7 @@ static void *conn_thread_main(void *arg) {
         if (h.opcode == 0x09) {
             if (!ensure_recv_cap(&payload, &cap, (size_t)h.len, c->max_frame))
                 break;
-            if (!ws_read_frame_payload(c->fd, h.len, h.masked, payload))
+            if (!ws_read_frame_payload(c, h.len, h.masked, payload))
                 break;
             /* Build a PONG frame (FIN + PONG = 0x8A; control payload ≤125
              * per RFC 6455 §5.5, so the 2-byte header always fits) and queue
@@ -1864,7 +1995,7 @@ static void *conn_thread_main(void *arg) {
         if (h.opcode == 0x0A) {
             if (!ensure_recv_cap(&payload, &cap, (size_t)h.len, c->max_frame))
                 break;
-            if (!ws_read_frame_payload(c->fd, h.len, h.masked, payload))
+            if (!ws_read_frame_payload(c, h.len, h.masked, payload))
                 break;
             continue;
         }
@@ -1873,7 +2004,7 @@ static void *conn_thread_main(void *arg) {
             if (h.len > 0) {
                 if (!ensure_recv_cap(&payload, &cap, (size_t)h.len, c->max_frame))
                     break;
-                (void)ws_read_frame_payload(c->fd, h.len, h.masked, payload);
+                (void)ws_read_frame_payload(c, h.len, h.masked, payload);
             }
             client_close = 1;
             break;
@@ -1899,13 +2030,13 @@ static void *conn_thread_main(void *arg) {
                     broker_log("recv buffer grow failed; closing");
                     goto free_payload;
                 }
-                if (!ws_read_frame_payload(c->fd, h.len, h.masked, payload + acc))
+                if (!ws_read_frame_payload(c, h.len, h.masked, payload + acc))
                     goto free_payload;
                 acc += (size_t)h.len;
             }
             if (h.fin)
                 break;
-            if (!ws_read_frame_header(c->fd, &h, c->max_frame - acc))
+            if (!ws_read_frame_header(c, &h, c->max_frame - acc))
                 goto free_payload;
             if (h.opcode == 0x08 || h.opcode == 0x09 || h.opcode == 0x0A) {
                 broker_log("control frame mid-message (0x%x); closing", h.opcode);
@@ -1949,6 +2080,8 @@ static void *conn_thread_main(void *arg) {
 free_payload:
     free(payload);
 done: {
+    free(c->carry);
+    c->carry = NULL;
     /* If closed was already set, a writer/fan-out kicked us (slow peer or
      * send failure): nothing queued is worth flushing. Otherwise (client
      * CLOSE, protocol error after an ERROR frame) let the writer drain for a
@@ -2152,6 +2285,7 @@ int main(void) {
         c->refs = 1;
         pthread_mutex_init(&c->out_mu, NULL);
         pthread_cond_init(&c->out_cv, NULL);
+        conn_all_register(c);
 
         pthread_attr_t attr;
         int attr_ok = (pthread_attr_init(&attr) == 0);

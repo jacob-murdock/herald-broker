@@ -23,11 +23,14 @@ Prefer private email over public issues for unfixed bugs. Coordinated disclosure
 - Late-join catch-up cap (`HERALD_BROKER_MAX_CATCHUP`; default 256 KiB, independent of max frame).
 - Max live connections (`HERALD_BROKER_MAX_CONNECTIONS`; default 8192; reject + close when full).
 - Optional per-TCP-peer connection cap (`HERALD_BROKER_MAX_CONNS_PER_IP`; default 0 = unlimited). Older builds hard-capped at 32 per peer address; that breaks reverse-proxy deploys where every client shares the proxy's IP. Set `HERALD_BROKER_MAX_CONNS_PER_IP=32` to restore the old in-process limit on direct exposure, or enforce per-client limits at the TLS terminator / proxy instead.
-- Per-connection **outbound queue** caps (`HERALD_BROKER_MAX_QUEUE_BYTES` / `HERALD_BROKER_MAX_QUEUE_MSGS`) plus a process-wide ceiling (`HERALD_BROKER_MAX_QUEUE_TOTAL`, default 1 GiB) so N colluding non-reading peers cannot pin unbounded memory. Fan-out never blocks on a slow socket; a peer that falls too far behind is disconnected (no silent per-frame drops). A send that makes no progress for the socket send timeout (`SO_SNDTIMEO`, 15 s) also kicks that peer — earlier builds retried `EAGAIN` forever there.
+- Per-connection **outbound queue** caps (`HERALD_BROKER_MAX_QUEUE_BYTES` / `HERALD_BROKER_MAX_QUEUE_MSGS`) plus a process-wide ceiling (`HERALD_BROKER_MAX_QUEUE_TOTAL`, default 1 GiB) so N colluding non-reading peers cannot pin unbounded memory. Fan-out never blocks on a slow socket; a peer that falls too far behind is disconnected (no silent per-frame drops); process-wide over-cap kicks the **heaviest** queue rather than the enqueue target; outbound enqueue allocation failure kicks the same way. A send that makes no progress for the socket send timeout (`SO_SNDTIMEO`, 15 s) also kicks that peer — earlier builds retried `EAGAIN` forever there.
 - Room table cap and peers-per-room cap.
 - Room map tombstones: evicting a colliding room does not hide later probe-chain occupants (leave still unlinks `Conn *`).
 - No disk persistence of room traffic; no room-list endpoint.
 - Permessage-deflate uses one-shot inflate/deflate (`no_context_takeover`).
+- Strict WebSocket frame length decoding (RFC 6455 §5.2: reject mis-encoded 126/127 lengths and non-zero high bits on 64-bit lengths).
+- JOIN rejects empty/overlong room ids, embedded NUL in room id or display name, and overlong display names (same bound as `HERALD_BROKER_MAX_NAME`).
+- Handshake stashes pipelined bytes after `\r\n\r\n` so the first WS frame cannot be dropped on coalesced TCP reads.
 - Docker image runs as uid 65532 (`herald`), not root.
 
 ## Recommended ops
